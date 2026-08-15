@@ -1,0 +1,31 @@
+cabal-version: 3.0
+name: uniffi-runtime
+version: 0.1.0.0
+synopsis: Haskell runtime support for UniFFI bindings
+license: MPL-2.0
+build-type: Simple
+
+library
+  exposed-modules:
+      UniFFI.Runtime
+  hs-source-dirs:
+      src
+  build-depends:
+      base >=4.15 && <5
+    , bytestring >=0.10 && <0.13
+    , text >=1.2 && <2.2
+  default-language: GHC2021
+  ghc-options: -Wall
+
+test-suite runtime-tests
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs:
+      test
+  build-depends:
+      base >=4.15 && <5
+    , bytestring >=0.10 && <0.13
+    , text >=1.2 && <2.2
+    , uniffi-runtime
+  default-language: GHC2021
+  ghc-options: -Wall

@@ -1,0 +1,205 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+
+uniffi::setup_scaffolding!("uniffi_haskell_fixture");
+
+#[derive(Clone, uniffi::Record)]
+pub struct Person {
+    pub name: String,
+    pub age: u8,
+    pub nickname: Option<String>,
+    pub scores: Vec<i32>,
+    pub avatar: Vec<u8>,
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum Status {
+    Idle,
+    Message { message: String },
+    Detailed(u32, String),
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum TestError {
+    #[error("division by zero")]
+    DivisionByZero,
+    #[error("invalid division: {message}")]
+    InvalidDivision { message: String },
+    #[error("negative divisor: {0}")]
+    NegativeDivisor(u32),
+}
+
+#[derive(uniffi::Object)]
+pub struct Counter {
+    value: AtomicI64,
+}
+
+#[uniffi::export]
+impl Counter {
+    #[uniffi::constructor]
+    pub fn new(initial: i64) -> Self {
+        Self {
+            value: AtomicI64::new(initial),
+        }
+    }
+
+    pub fn add(&self, delta: i64) -> i64 {
+        self.value
+            .fetch_add(delta, Ordering::SeqCst)
+            .wrapping_add(delta)
+    }
+
+    pub fn get(&self) -> i64 {
+        self.value.load(Ordering::SeqCst)
+    }
+}
+
+#[uniffi::export]
+pub fn roundtrip_person(value: Person) -> Person {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_status(value: Status) -> Status {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_optional_person(value: Option<Person>) -> Option<Person> {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_people(value: Vec<Person>) -> Vec<Person> {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_strings(value: Vec<String>) -> Vec<String> {
+    value
+}
+
+#[uniffi::export]
+pub fn divide(dividend: i32, divisor: i32) -> Result<i32, TestError> {
+    if divisor == 0 {
+        Err(TestError::DivisionByZero)
+    } else if dividend == i32::MIN && divisor == -1 {
+        Err(TestError::InvalidDivision {
+            message: "integer overflow".to_string(),
+        })
+    } else if divisor < 0 {
+        Err(TestError::NegativeDivisor(divisor.unsigned_abs()))
+    } else {
+        Ok(dividend / divisor)
+    }
+}
+
+#[uniffi::export]
+pub fn ping() {}
+
+#[uniffi::export]
+pub fn add(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+#[uniffi::export]
+pub fn roundtrip_u8(value: u8) -> u8 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_i8(value: i8) -> i8 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_u16(value: u16) -> u16 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_i16(value: i16) -> i16 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_u32(value: u32) -> u32 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_i32(value: i32) -> i32 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_u64(value: u64) -> u64 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_i64(value: i64) -> i64 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_f32(value: f32) -> f32 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_f64(value: f64) -> f64 {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_bool(value: bool) -> bool {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_string(value: String) -> String {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_bytes(value: Vec<u8>) -> Vec<u8> {
+    value
+}
+
+#[uniffi::export]
+pub fn panic_now() {
+    panic!("fixture panic");
+}
+
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn sum_mixed_primitives(
+    a: u8,
+    b: i8,
+    c: u16,
+    d: i16,
+    e: u32,
+    f: i32,
+    g: u64,
+    h: i64,
+    i: f32,
+    j: f64,
+    negate: bool,
+) -> f64 {
+    let sum = a as f64
+        + b as f64
+        + c as f64
+        + d as f64
+        + e as f64
+        + f as f64
+        + g as f64
+        + h as f64
+        + i as f64
+        + j;
+
+    if negate {
+        -sum
+    } else {
+        sum
+    }
+}

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [[ -z "${IN_NIX_SHELL:-}" ]]; then
+  exec nix develop "path:$project_root" --command "$0"
+fi
+
+cd "$project_root"
+
+cargo fmt --all -- --check
+cargo test --workspace
+cargo build -p uniffi-haskell-fixture
+
+case "$(uname -s)" in
+  Darwin)
+    fixture_library="$project_root/target/debug/libuniffi_haskell_fixture.dylib"
+    ;;
+  Linux)
+    fixture_library="$project_root/target/debug/libuniffi_haskell_fixture.so"
+    ;;
+  *)
+    echo "unsupported test platform: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+
+generated_dir="$project_root/tests/haskell/generated"
+cargo run -p uniffi-bindgen-haskell --bin uniffi-bindgen-haskell -- \
+  --library "$fixture_library" \
+  --out-dir "$generated_dir"
+
+mkdir -p "$generated_dir/native-static"
+cp "$project_root/target/debug/libuniffi_haskell_fixture.a" \
+  "$generated_dir/native-static/libuniffi_haskell_fixture.a"
+
+cabal test all --test-show-details=direct

@@ -1,0 +1,16 @@
+[package]
+name = "uniffi-bindgen-haskell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uniffi-bindgen-haskell"
+path = "src/bin/uniffi-bindgen-haskell.rs"
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uniffi_bindgen.workspace = true

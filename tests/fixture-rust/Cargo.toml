@@ -1,0 +1,13 @@
+[package]
+name = "uniffi-haskell-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "uniffi_haskell_fixture"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+thiserror = "2"
+uniffi = { workspace = true }

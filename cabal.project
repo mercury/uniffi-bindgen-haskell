@@ -1,0 +1,6 @@
+packages:
+  haskell/uniffi-runtime
+  tests/haskell
+
+index-state: 2024-01-01T00:00:00Z
+write-ghc-environment-files: never

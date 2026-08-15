@@ -1,0 +1,35 @@
+cabal-version: 3.0
+name: uniffi-haskell-tests
+version: 0.1.0.0
+license: MPL-2.0
+build-type: Simple
+
+common test-settings
+  default-language: GHC2021
+  ghc-options: -Wall -threaded
+  hs-source-dirs:
+      test
+      generated/haskell
+  other-modules:
+      UniFFI.UniffiHaskellFixture
+  build-depends:
+      base >=4.15 && <5
+    , bytestring >=0.10 && <0.13
+    , text >=1.2 && <2.2
+    , uniffi-runtime
+  include-dirs:
+      generated/cbits
+  c-sources:
+      generated/cbits/uniffi_uniffi_haskell_fixture_haskell.c
+  cc-options: -std=c11
+  extra-lib-dirs:
+      generated/native-static
+  extra-libraries:
+      uniffi_haskell_fixture
+      c
+      m
+
+test-suite e2e
+  import: test-settings
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
