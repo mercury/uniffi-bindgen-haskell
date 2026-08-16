@@ -9,6 +9,7 @@ use crate::ir::{
     general, Bindings, FfiDefinition, FfiFunction, FfiFunctionType, FfiStruct, FfiType, FieldsKind,
     Namespace as NamespacePlan, Type, TypeDefinition, UniFfiNamespace,
 };
+use crate::CabalOptions;
 
 type Namespace = UniFfiNamespace;
 
@@ -27,7 +28,11 @@ struct Manifest {
     required_native_libraries: Vec<String>,
 }
 
-pub(crate) fn write(bindings: &Bindings, out_dir: &Utf8Path) -> Result<()> {
+pub(crate) fn write(
+    bindings: &Bindings,
+    out_dir: &Utf8Path,
+    cabal: Option<&CabalOptions>,
+) -> Result<()> {
     fs::create_dir_all(out_dir)?;
 
     let mut manifest = Manifest {
@@ -52,6 +57,68 @@ pub(crate) fn write(bindings: &Bindings, out_dir: &Utf8Path) -> Result<()> {
         manifest_path,
         serde_json::to_string_pretty(&manifest)? + "\n",
     )?;
+    if let Some(cabal) = cabal {
+        write_cabal_file(out_dir, &manifest, cabal)?;
+    }
+    Ok(())
+}
+
+fn write_cabal_file(out_dir: &Utf8Path, manifest: &Manifest, options: &CabalOptions) -> Result<()> {
+    let file_name = options.file_name.as_str();
+    if options.file_name.is_absolute() || file_name.contains('/') || file_name.contains('\\') {
+        bail!("--cabal-file must be a file name relative to --out-dir");
+    }
+    if options.package_name.is_empty()
+        || !options
+            .package_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        bail!("--cabal-package-name must contain only ASCII letters, digits, and hyphens");
+    }
+
+    let mut output = String::new();
+    writeln!(output, "cabal-version: 3.0")?;
+    writeln!(output, "name: {}", options.package_name)?;
+    writeln!(output, "version: 0.1.0.0")?;
+    writeln!(output, "license: MPL-2.0")?;
+    writeln!(output, "build-type: Simple")?;
+    writeln!(output)?;
+    writeln!(output, "library")?;
+    writeln!(output, "  exposed-modules:")?;
+    for module in &manifest.public_haskell_modules {
+        writeln!(output, "      {module}")?;
+    }
+    writeln!(output, "  other-modules:")?;
+    for module in &manifest.internal_haskell_modules {
+        writeln!(output, "      {module}")?;
+    }
+    writeln!(output, "  hs-source-dirs: haskell")?;
+    writeln!(output, "  build-depends:")?;
+    writeln!(output, "      base >=4.15 && <5")?;
+    writeln!(output, "    , bytestring >=0.10 && <0.13")?;
+    writeln!(output, "    , containers >=0.6 && <0.8")?;
+    writeln!(output, "    , text >=1.2 && <2.2")?;
+    writeln!(output, "    , uniffi-runtime")?;
+    writeln!(output, "  include-dirs: cbits")?;
+    writeln!(output, "  c-sources:")?;
+    for source in &manifest.c_sources {
+        writeln!(output, "      {source}")?;
+    }
+    writeln!(output, "  cc-options: -std=c11")?;
+    if let Some(extra_lib_dir) = &options.extra_lib_dir {
+        writeln!(output, "  extra-lib-dirs: {extra_lib_dir}")?;
+    }
+    writeln!(output, "  extra-libraries:")?;
+    writeln!(output, "      {}", options.native_library)?;
+    writeln!(output, "      c")?;
+    writeln!(output, "      m")?;
+    writeln!(output, "  default-language: GHC2021")?;
+    writeln!(output, "  ghc-options: -Wall")?;
+
+    let path = out_dir.join(&options.file_name);
+    create_parent(&path)?;
+    fs::write(path, output)?;
     Ok(())
 }
 

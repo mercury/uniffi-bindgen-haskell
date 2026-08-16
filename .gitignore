@@ -1,5 +1,6 @@
 /target/
 /dist-newstyle/
+/dist-newstyle-generated-cabal/
 /build/
 /generated/
 /tests/generated/

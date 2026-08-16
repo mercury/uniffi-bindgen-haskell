@@ -11,6 +11,7 @@ path = "src/bin/uniffi-bindgen-haskell.rs"
 [dependencies]
 anyhow.workspace = true
 camino.workspace = true
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uniffi_bindgen.workspace = true

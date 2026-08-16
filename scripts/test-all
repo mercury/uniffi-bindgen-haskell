@@ -4,7 +4,7 @@ set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ -z "${IN_NIX_SHELL:-}" ]]; then
-  exec nix develop "path:$project_root" --command "$0"
+  exec nix develop "$project_root" --command "$0"
 fi
 
 cd "$project_root"
@@ -29,10 +29,17 @@ esac
 generated_dir="$project_root/tests/haskell/generated"
 cargo run -p uniffi-bindgen-haskell --bin uniffi-bindgen-haskell -- \
   --library "$fixture_library" \
-  --out-dir "$generated_dir"
+  --out-dir "$generated_dir" \
+  --cabal-file uniffi-haskell-fixture-bindings.cabal \
+  --cabal-package-name uniffi-haskell-fixture-bindings \
+  --cabal-extra-lib-dir "$generated_dir/native-static"
 
 mkdir -p "$generated_dir/native-static"
 cp "$project_root/target/debug/libuniffi_haskell_fixture.a" \
   "$generated_dir/native-static/libuniffi_haskell_fixture.a"
 
 cabal test all --test-show-details=direct
+cabal build \
+  --project-file=cabal.generated.project \
+  --builddir=dist-newstyle-generated-cabal \
+  all
