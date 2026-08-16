@@ -1,11 +1,24 @@
 module Main (main) where
 
-import Control.Exception (evaluate, try)
-import Control.Monad (unless)
+import Control.Concurrent
+  ( forkIO
+  , modifyMVar_
+  , newEmptyMVar
+  , newMVar
+  , putMVar
+  , readMVar
+  , takeMVar
+  , tryPutMVar
+  , tryReadMVar
+  )
+import Control.Exception (Exception, SomeException, evaluate, fromException, throwIO, try)
+import Control.Monad (replicateM, replicateM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int8, Int16, Int32, Int64)
+import Data.IORef (IORef, newIORef)
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -18,8 +31,18 @@ import Foreign.Storable (Storable (..), peekByteOff)
 import Prelude hiding (readList)
 import UniFFI.Runtime
 
+newtype InitializationFailure = InitializationFailure (IORef ())
+
+instance Show InitializationFailure where
+  show _ = "InitializationFailure"
+
+instance Exception InitializationFailure
+
 main :: IO ()
 main = do
+  testInitializationSuccess
+  testInitializationFailure
+  testInitializationReentrancy
   testStorableLayouts
   testSuccessStatus
   testUtf8
@@ -37,6 +60,23 @@ assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual =
   unless (expected == actual) $
     fail (label ++ ": expected " ++ show expected ++ ", got " ++ show actual)
+
+assertSucceeded :: String -> Either SomeException () -> IO ()
+assertSucceeded label result =
+  case result of
+    Left exception -> fail (label ++ ": unexpected exception: " ++ show exception)
+    Right () -> pure ()
+
+assertInitializationFailure :: String -> IORef () -> Either SomeException () -> IO ()
+assertInitializationFailure label expectedToken result =
+  case result of
+    Left exception ->
+      case fromException exception of
+        Just (InitializationFailure actualToken) ->
+          unless (actualToken == expectedToken) $
+            fail (label ++ ": received a different InitializationFailure")
+        Nothing -> fail (label ++ ": unexpected exception: " ++ show exception)
+    Right () -> fail (label ++ ": initialization unexpectedly succeeded")
 
 assertCodec :: (Eq a, Show a) => String -> ByteString -> (a -> Encoder) -> Decoder a -> a -> IO ()
 assertCodec label expected writeValue readValue value = do
@@ -60,6 +100,80 @@ assertEncoderFails label encoder = do
 
 alignUp :: Int -> Int -> Int
 alignUp offset boundary = ((offset + boundary - 1) `div` boundary) * boundary
+
+testInitializationSuccess :: IO ()
+testInitializationSuccess = do
+  initialization <- newInitialization
+  executionCount <- newMVar (0 :: Int)
+  ready <- newEmptyMVar
+  start <- newEmptyMVar
+  actionStarted <- newEmptyMVar
+  finishAction <- newEmptyMVar
+  let callerCount = 32
+      action = do
+        modifyMVar_ executionCount (pure . (+ 1))
+        void (tryPutMVar actionStarted ())
+        readMVar finishAction
+      caller resultVariable = do
+        putMVar ready ()
+        readMVar start
+        result <- try (runInitialization initialization action)
+        putMVar resultVariable result
+  resultVariables <- replicateM callerCount newEmptyMVar
+  mapM_ (forkIO . caller) resultVariables
+  replicateM_ callerCount (takeMVar ready)
+  putMVar start ()
+  takeMVar actionStarted
+  blockedExecutionCount <- readMVar executionCount
+  assertEqual "concurrent initialization execution count while blocked" 1 blockedExecutionCount
+  completedBeforeRelease <- mapM (fmap isJust . tryReadMVar) resultVariables
+  assertEqual
+    "concurrent initialization callers wait"
+    (replicate callerCount False)
+    completedBeforeRelease
+  putMVar finishAction ()
+  results <- mapM takeMVar resultVariables
+  mapM_ (assertSucceeded "concurrent initialization") results
+  finalExecutionCount <- readMVar executionCount
+  assertEqual "concurrent initialization execution count" 1 finalExecutionCount
+  runInitialization initialization (modifyMVar_ executionCount (pure . (+ 1)))
+  cachedExecutionCount <- readMVar executionCount
+  assertEqual "successful initialization is cached" 1 cachedExecutionCount
+
+testInitializationFailure :: IO ()
+testInitializationFailure = do
+  initialization <- newInitialization
+  executionCount <- newMVar (0 :: Int)
+  token <- newIORef ()
+  firstResult <-
+    try $
+      runInitialization initialization $ do
+        modifyMVar_ executionCount (pure . (+ 1))
+        throwIO (InitializationFailure token)
+  assertInitializationFailure "initial initialization failure" token firstResult
+  secondResult <-
+    try $
+      runInitialization initialization $
+        modifyMVar_ executionCount (pure . (+ 1))
+  assertInitializationFailure "cached initialization failure" token secondResult
+  thirdResult <-
+    try $
+      runInitialization initialization $
+        modifyMVar_ executionCount (pure . (+ 1))
+  assertInitializationFailure "repeated cached initialization failure" token thirdResult
+  finalExecutionCount <- readMVar executionCount
+  assertEqual "failed initialization execution count" 1 finalExecutionCount
+
+testInitializationReentrancy :: IO ()
+testInitializationReentrancy = do
+  initialization <- newInitialization
+  executionCount <- newMVar (0 :: Int)
+  runInitialization initialization $ do
+    modifyMVar_ executionCount (pure . (+ 1))
+    runInitialization initialization (modifyMVar_ executionCount (pure . (+ 100)))
+  runInitialization initialization (modifyMVar_ executionCount (pure . (+ 100)))
+  finalExecutionCount <- readMVar executionCount
+  assertEqual "reentrant initialization execution count" 1 finalExecutionCount
 
 testStorableLayouts :: IO ()
 testStorableLayouts = do

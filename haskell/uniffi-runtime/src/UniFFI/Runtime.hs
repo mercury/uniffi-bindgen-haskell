@@ -5,6 +5,9 @@ module UniFFI.Runtime
   , ForeignBytes (..)
   , RustCallStatus (..)
   , UniFFIException (..)
+  , Initialization
+  , newInitialization
+  , runInitialization
   , Timestamp (..)
   , Duration (..)
   , RustBufferFromBytes
@@ -84,8 +87,21 @@ module UniFFI.Runtime
   , deserializeBytes
   ) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, takeMVar, tryPutMVar, withMVar)
-import Control.Exception (Exception, SomeException, catch, finally, mask, onException, throw, throwIO)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar
+  ( MVar
+  , modifyMVar
+  , modifyMVar_
+  , newEmptyMVar
+  , newMVar
+  , putMVar
+  , readMVar
+  , takeMVar
+  , tryPutMVar
+  , tryReadMVar
+  , withMVar
+  )
+import Control.Exception (Exception, SomeException, catch, finally, mask, onException, throw, throwIO, try)
 import Control.Monad (replicateM, unless, void, when)
 import Data.Bits (Bits, (.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
@@ -175,6 +191,14 @@ instance Storable RustCallStatus where
 newtype UniFFIException = UniFFIException Text
   deriving (Eq, Show)
 
+newtype Initialization =
+  Initialization (MVar (Maybe (ThreadId, MVar (Either SomeException ()))))
+
+data InitializationCall
+  = ExecuteInitialization (MVar (Either SomeException ()))
+  | AwaitInitialization (MVar (Either SomeException ()))
+  | ReentrantInitialization
+
 data Timestamp = Timestamp Int64 Word32
   deriving (Eq, Ord, Show)
 
@@ -182,6 +206,44 @@ data Duration = Duration Word64 Word32
   deriving (Eq, Ord, Show)
 
 instance Exception UniFFIException
+
+newInitialization :: IO Initialization
+newInitialization = Initialization <$> newMVar Nothing
+
+runInitialization :: Initialization -> IO () -> IO ()
+runInitialization (Initialization state) action =
+  mask $ \restore -> do
+    threadId <- myThreadId
+    proposedResult <- newEmptyMVar
+    initializationCall <-
+      modifyMVar state $ \current ->
+        case current of
+          Nothing ->
+            pure
+              ( Just (threadId, proposedResult)
+              , ExecuteInitialization proposedResult
+              )
+          Just (owner, result)
+            | owner /= threadId -> pure (current, AwaitInitialization result)
+            | otherwise -> do
+                completed <- tryReadMVar result
+                pure
+                  ( current
+                  , case completed of
+                      Nothing -> ReentrantInitialization
+                      Just _ -> AwaitInitialization result
+                  )
+    case initializationCall of
+      ExecuteInitialization resultVariable -> do
+        result <- try (restore action)
+        putMVar resultVariable result
+        rethrowInitializationResult result
+      AwaitInitialization resultVariable ->
+        restore (readMVar resultVariable) >>= rethrowInitializationResult
+      ReentrantInitialization -> pure ()
+
+rethrowInitializationResult :: Either SomeException () -> IO ()
+rethrowInitializationResult = either throwIO pure
 
 type RustBufferFromBytes = Ptr ForeignBytes -> Ptr RustBuffer -> Ptr RustCallStatus -> IO ()
 

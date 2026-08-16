@@ -12,7 +12,9 @@ common test-settings
       generated/haskell
   other-modules:
       UniFFI.UniffiHaskellExternalFixture
+      UniFFI.UniffiHaskellExternalFixture.Internal
       UniFFI.UniffiHaskellFixture
+      UniFFI.UniffiHaskellFixture.Internal
   build-depends:
       base >=4.15 && <5
     , bytestring >=0.10 && <0.13
