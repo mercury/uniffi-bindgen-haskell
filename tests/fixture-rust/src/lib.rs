@@ -150,6 +150,10 @@ impl Counter {
         self.value.load(Ordering::SeqCst)
     }
 
+    pub fn sum_bytes(&self, value: &[u8]) -> u32 {
+        value.iter().map(|byte| u32::from(*byte)).sum()
+    }
+
     pub fn roundtrip_person(&self, person: Person) -> Person {
         person
     }

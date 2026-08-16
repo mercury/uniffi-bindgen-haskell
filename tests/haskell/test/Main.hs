@@ -251,6 +251,8 @@ testObjects = do
   counter <- newCounter 10
   counterGet counter >>= assertEqual "object initial value" 10
   counterAdd counter 5 >>= assertEqual "object method result" 15
+  counterSumBytes counter (ByteString.pack [1, 2, 3])
+    >>= assertEqual "object borrowed bytes" 6
   let person = Person (Text.pack "Object") 2 Nothing [1] ByteString.empty
   counterRoundtripPerson counter person >>= assertEqual "object buffer method" person
   counterFallibleGet counter False >>= assertEqual "object fallible success" (Right 15)

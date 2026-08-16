@@ -41,15 +41,28 @@ fn normalize_borrowed_byte_arguments(root: &mut ir::general::Root) {
     for namespace in root.namespaces.values_mut() {
         let mut borrowed_arguments = HashMap::<String, Vec<usize>>::new();
         for function in &mut namespace.functions {
-            let mut indices = Vec::new();
-            for (index, argument) in function.callable.arguments.iter_mut().enumerate() {
-                if argument.is_borrowed_bytes() {
-                    argument.ty.ffi_type = FfiType::ForeignBytes;
-                    indices.push(index);
+            normalize_callable_borrowed_byte_arguments(
+                &mut function.callable,
+                0,
+                &mut borrowed_arguments,
+            );
+        }
+        for definition in &mut namespace.type_definitions {
+            if let ir::general::TypeDefinition::Interface(interface) = definition {
+                for constructor in &mut interface.constructors {
+                    normalize_callable_borrowed_byte_arguments(
+                        &mut constructor.callable,
+                        0,
+                        &mut borrowed_arguments,
+                    );
                 }
-            }
-            if !indices.is_empty() {
-                borrowed_arguments.insert(function.callable.ffi_func.0.clone(), indices);
+                for method in &mut interface.methods {
+                    normalize_callable_borrowed_byte_arguments(
+                        &mut method.callable,
+                        1,
+                        &mut borrowed_arguments,
+                    );
+                }
             }
         }
 
@@ -67,6 +80,23 @@ fn normalize_borrowed_byte_arguments(root: &mut ir::general::Root) {
                 definition
             })
             .collect();
+    }
+}
+
+fn normalize_callable_borrowed_byte_arguments(
+    callable: &mut ir::general::Callable,
+    ffi_argument_offset: usize,
+    borrowed_arguments: &mut HashMap<String, Vec<usize>>,
+) {
+    let mut indices = Vec::new();
+    for (index, argument) in callable.arguments.iter_mut().enumerate() {
+        if argument.is_borrowed_bytes() {
+            argument.ty.ffi_type = FfiType::ForeignBytes;
+            indices.push(index + ffi_argument_offset);
+        }
+    }
+    if !indices.is_empty() {
+        borrowed_arguments.insert(callable.ffi_func.0.clone(), indices);
     }
 }
 
