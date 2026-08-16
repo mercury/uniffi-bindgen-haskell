@@ -1,10 +1,25 @@
+{-# LANGUAGE ForeignFunctionInterface #-}
+
 module UniFFI.Runtime
   ( RustBuffer (..)
   , ForeignBytes (..)
   , RustCallStatus (..)
   , UniFFIException (..)
+  , Timestamp (..)
+  , Duration (..)
   , RustBufferFromBytes
   , RustBufferFree
+  , RustFutureContinuation
+  , RustFuturePoll
+  , RustFutureCancel
+  , RustFutureFree
+  , runRustFuture
+  , newCallbackHandle
+  , cloneCallbackHandle
+  , freeCallbackHandle
+  , dereferenceCallbackHandle
+  , setCallbackError
+  , setCallbackUnexpectedError
   , RustObject
   , newRustObject
   , withRustObject
@@ -13,6 +28,11 @@ module UniFFI.Runtime
   , successRustCallStatus
   , withRustCallStatus
   , lowerRustBuffer
+  , withForeignBytes
+  , MutableBytes
+  , newMutableBytes
+  , readMutableBytes
+  , withMutableForeignBytes
   , consumeRustBuffer
   , checkRustCallStatus
   , checkRustCallStatusWithError
@@ -35,6 +55,10 @@ module UniFFI.Runtime
   , writeBytes
   , writeMaybe
   , writeList
+  , writeMap
+  , writeSet
+  , writeTimestamp
+  , writeDuration
   , Decoder
   , runDecoder
   , readWord8
@@ -52,12 +76,16 @@ module UniFFI.Runtime
   , readBytes
   , readMaybe
   , readList
+  , readMap
+  , readSet
+  , readTimestamp
+  , readDuration
   , serializeBytes
   , deserializeBytes
   ) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, withMVar)
-import Control.Exception (Exception, SomeException, catch, finally, throw, throwIO)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, takeMVar, tryPutMVar, withMVar)
+import Control.Exception (Exception, SomeException, catch, finally, mask, onException, throw, throwIO)
 import Control.Monad (replicateM, unless, void, when)
 import Data.Bits (Bits, (.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
@@ -65,19 +93,26 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Int (Int8, Int16, Int32, Int64)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import Data.Text.Encoding.Error (UnicodeException)
 import Data.Word (Word8, Word16, Word32, Word64)
 import qualified Foreign.Concurrent as ForeignConcurrent
-import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr, withForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr, mallocForeignPtrBytes, withForeignPtr)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
+import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Marshal.Alloc (alloca, free, mallocBytes)
-import Foreign.Marshal.Utils (with)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Marshal.Utils (copyBytes, with)
+
 import Foreign.Storable (Storable (..), peekByteOff, pokeByteOff)
 import GHC.Float (castWord32ToFloat, castWord64ToDouble)
 import Prelude hiding (readList)
+import System.IO.Unsafe (unsafePerformIO)
 
 
 data RustBuffer = RustBuffer
@@ -140,11 +175,103 @@ instance Storable RustCallStatus where
 newtype UniFFIException = UniFFIException Text
   deriving (Eq, Show)
 
+data Timestamp = Timestamp Int64 Word32
+  deriving (Eq, Ord, Show)
+
+data Duration = Duration Word64 Word32
+  deriving (Eq, Ord, Show)
+
 instance Exception UniFFIException
 
 type RustBufferFromBytes = Ptr ForeignBytes -> Ptr RustBuffer -> Ptr RustCallStatus -> IO ()
 
 type RustBufferFree = Ptr RustBuffer -> Ptr RustCallStatus -> IO ()
+
+type RustFutureContinuation = Word64 -> Int8 -> IO ()
+
+type RustFuturePoll = Word64 -> FunPtr RustFutureContinuation -> Word64 -> IO ()
+
+type RustFutureCancel = Word64 -> IO ()
+
+type RustFutureFree = Word64 -> IO ()
+
+foreign import ccall "wrapper"
+  makeRustFutureContinuation :: RustFutureContinuation -> IO (FunPtr RustFutureContinuation)
+
+rustFutureContinuation :: FunPtr RustFutureContinuation
+rustFutureContinuation = unsafePerformIO (makeRustFutureContinuation continueRustFuture)
+{-# NOINLINE rustFutureContinuation #-}
+
+continueRustFuture :: RustFutureContinuation
+continueRustFuture token pollCode = do
+  let stablePointer = castPtrToStablePtr (wordPtrToPtr (fromIntegral token))
+  gate <- deRefStablePtr stablePointer
+  freeStablePtr stablePointer
+  void (tryPutMVar gate pollCode)
+
+pollRustFutureOnce :: RustFuturePoll -> Word64 -> IO Int8
+pollRustFutureOnce pollFuture handle =
+  mask $ \restore -> do
+    gate <- newEmptyMVar
+    stablePointer <- newStablePtr gate
+    let token = fromIntegral (ptrToWordPtr (castStablePtrToPtr stablePointer))
+    pollFuture handle rustFutureContinuation token
+    restore (takeMVar gate)
+
+runRustFuture
+  :: IO Word64
+  -> RustFuturePoll
+  -> RustFutureCancel
+  -> RustFutureFree
+  -> (Word64 -> IO result)
+  -> IO result
+runRustFuture start pollFuture cancelFuture freeFuture completeFuture =
+  mask $ \restore -> do
+    handle <- start
+    let awaitReady = do
+          pollCode <- pollRustFutureOnce pollFuture handle
+          case pollCode of
+            0 -> pure ()
+            1 -> awaitReady
+            other -> throwUniFFIException ("Unknown Rust future poll code: " ++ show other)
+        run = awaitReady >> completeFuture handle
+    (restore run `onException` cancelFuture handle) `finally` freeFuture handle
+
+newCallbackHandle :: value -> IO Word64
+newCallbackHandle value = do
+  stablePointer <- newStablePtr value
+  pure (fromIntegral (ptrToWordPtr (castStablePtrToPtr stablePointer)))
+
+cloneCallbackHandle :: Word64 -> IO Word64
+cloneCallbackHandle handle = dereferenceCallbackHandle handle >>= newCallbackHandle
+
+freeCallbackHandle :: Word64 -> IO ()
+freeCallbackHandle handle =
+  freeStablePtr (castPtrToStablePtr (wordPtrToPtr (fromIntegral handle)))
+
+dereferenceCallbackHandle :: Word64 -> IO value
+dereferenceCallbackHandle handle =
+  deRefStablePtr (castPtrToStablePtr (wordPtrToPtr (fromIntegral handle)))
+
+setCallbackError
+  :: RustBufferFromBytes
+  -> RustBufferFree
+  -> ByteString
+  -> Ptr RustCallStatus
+  -> IO ()
+setCallbackError fromBytes freeBuffer bytes statusPointer = do
+  buffer <- lowerRustBuffer fromBytes freeBuffer bytes
+  poke statusPointer (RustCallStatus callError buffer)
+
+setCallbackUnexpectedError
+  :: RustBufferFromBytes
+  -> RustBufferFree
+  -> String
+  -> Ptr RustCallStatus
+  -> IO ()
+setCallbackUnexpectedError fromBytes freeBuffer message statusPointer = do
+  buffer <- lowerRustBuffer fromBytes freeBuffer (encodeUtf8 (Text.pack message))
+  poke statusPointer (RustCallStatus callUnexpectedError buffer)
 
 data RustObject = RustObject (MVar (Maybe Word64)) (ForeignPtr ())
 
@@ -209,6 +336,36 @@ lowerRustBuffer fromBytes freeBuffer bytes =
             fromBytes foreignBytesPtr bufferPtr statusPtr
       checkRustCallStatus freeBuffer status
       peek bufferPtr
+
+withForeignBytes :: ByteString -> (Ptr ForeignBytes -> IO a) -> IO a
+withForeignBytes bytes action =
+  ByteString.useAsCStringLen bytes $ \(bytesPtr, byteLength) -> do
+    when (byteLength > fromIntegral (maxBound :: Int32)) $
+      throwUniFFIException "ByteString is too large for ForeignBytes"
+    with (ForeignBytes (fromIntegral byteLength) (castPtr bytesPtr)) action
+
+data MutableBytes = MutableBytes Int (ForeignPtr Word8)
+
+newMutableBytes :: ByteString -> IO MutableBytes
+newMutableBytes bytes = do
+  let byteLength = ByteString.length bytes
+  when (byteLength > fromIntegral (maxBound :: Int32)) $
+    throwUniFFIException "ByteString is too large for mutable ForeignBytes"
+  pointer <- mallocForeignPtrBytes byteLength
+  withForeignPtr pointer $ \destination ->
+    ByteString.useAsCString bytes $ \source ->
+      copyBytes destination (castPtr source) byteLength
+  pure (MutableBytes byteLength pointer)
+
+readMutableBytes :: MutableBytes -> IO ByteString
+readMutableBytes (MutableBytes byteLength pointer) =
+  withForeignPtr pointer $ \bytesPointer ->
+    ByteString.packCStringLen (castPtr bytesPointer, byteLength)
+
+withMutableForeignBytes :: MutableBytes -> (Ptr ForeignBytes -> IO a) -> IO a
+withMutableForeignBytes (MutableBytes byteLength pointer) action =
+  withForeignPtr pointer $ \bytesPointer ->
+    with (ForeignBytes (fromIntegral byteLength) bytesPointer) action
 
 consumeRustBuffer :: RustBufferFree -> RustBuffer -> IO ByteString
 consumeRustBuffer freeBuffer buffer =
@@ -309,6 +466,23 @@ writeMaybe writeValue (Just value) = writeWord8 1 <> writeValue value
 writeList :: (a -> Encoder) -> [a] -> Encoder
 writeList writeValue values =
   writeLength "list" (length values) <> foldMap writeValue values
+
+writeMap :: (key -> Encoder) -> (value -> Encoder) -> Map key value -> Encoder
+writeMap writeKey writeValue values =
+  writeLength "map" (Map.size values)
+    <> foldMap (\(key, value) -> writeKey key <> writeValue value) (Map.toAscList values)
+
+writeSet :: (a -> Encoder) -> Set a -> Encoder
+writeSet writeValue values =
+  writeLength "set" (Set.size values) <> foldMap writeValue (Set.toAscList values)
+
+writeTimestamp :: Timestamp -> Encoder
+writeTimestamp (Timestamp seconds nanoseconds) =
+  writeInt64 seconds <> writeNanoseconds "Timestamp" nanoseconds
+
+writeDuration :: Duration -> Encoder
+writeDuration (Duration seconds nanoseconds) =
+  writeWord64 seconds <> writeNanoseconds "Duration" nanoseconds
 
 newtype Decoder a = Decoder (ByteString -> Either String (a, ByteString))
 
@@ -418,11 +592,48 @@ readList readValue = do
     then fail ("Negative list count: " ++ show count)
     else replicateM (fromIntegral count) readValue
 
+readMap :: Ord key => Decoder key -> Decoder value -> Decoder (Map key value)
+readMap readKey readValue = do
+  count <- readInt32
+  if count < 0
+    then fail ("Negative map count: " ++ show count)
+    else Map.fromList <$> replicateM (fromIntegral count) ((,) <$> readKey <*> readValue)
+
+readSet :: Ord a => Decoder a -> Decoder (Set a)
+readSet readValue = do
+  count <- readInt32
+  if count < 0
+    then fail ("Negative set count: " ++ show count)
+    else Set.fromList <$> replicateM (fromIntegral count) readValue
+
+readTimestamp :: Decoder Timestamp
+readTimestamp = Timestamp <$> readInt64 <*> readNanoseconds "Timestamp"
+
+readDuration :: Decoder Duration
+readDuration = Duration <$> readWord64 <*> readNanoseconds "Duration"
+
 writeLength :: String -> Int -> Encoder
 writeLength description value
   | value > fromIntegral (maxBound :: Int32) =
       throwEncoderException ("UniFFI " ++ description ++ " length exceeds the Int32 range")
   | otherwise = writeInt32 (fromIntegral value)
+
+writeNanoseconds :: String -> Word32 -> Encoder
+writeNanoseconds description nanoseconds
+  | nanoseconds > maximumNanoseconds =
+      throwEncoderException
+        (description ++ " nanoseconds exceed 999999999: " ++ show nanoseconds)
+  | otherwise = writeWord32 nanoseconds
+
+readNanoseconds :: String -> Decoder Word32
+readNanoseconds description = do
+  nanoseconds <- readWord32
+  if nanoseconds > maximumNanoseconds
+    then fail (description ++ " nanoseconds exceed 999999999: " ++ show nanoseconds)
+    else pure nanoseconds
+
+maximumNanoseconds :: Word32
+maximumNanoseconds = 999999999
 
 throwEncoderException :: String -> a
 throwEncoderException = throw . UniFFIException . Text.pack

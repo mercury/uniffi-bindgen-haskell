@@ -13,6 +13,7 @@ library
   build-depends:
       base >=4.15 && <5
     , bytestring >=0.10 && <0.13
+    , containers >=0.6 && <0.8
     , text >=1.2 && <2.2
   default-language: GHC2021
   ghc-options: -Wall
@@ -25,6 +26,7 @@ test-suite runtime-tests
   build-depends:
       base >=4.15 && <5
     , bytestring >=0.10 && <0.13
+    , containers >=0.6 && <0.8
     , text >=1.2 && <2.2
     , uniffi-runtime
   default-language: GHC2021

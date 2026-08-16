@@ -10,4 +10,5 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 thiserror = "2"
-uniffi = { workspace = true }
+uniffi = "=0.32.0"
+uniffi-haskell-external-fixture = { path = "../external-rust" }

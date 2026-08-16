@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 
@@ -35,7 +36,8 @@ pub fn generate(options: GenerateOptions) -> Result<()> {
         .with_context(|| format!("failed to load UniFFI metadata from {}", options.library))?;
     let initial_root = loader.load_pipeline_initial_root(&options.library, metadata)?;
     let mut pipeline = general::pipeline("haskell");
-    let root = pipeline.execute(initial_root)?;
+    let mut root = pipeline.execute(initial_root)?;
+    normalize_borrowed_byte_arguments(&mut root);
 
     fs::create_dir_all(&options.out_dir)?;
 
@@ -60,6 +62,39 @@ pub fn generate(options: GenerateOptions) -> Result<()> {
         serde_json::to_string_pretty(&manifest)? + "\n",
     )?;
     Ok(())
+}
+
+fn normalize_borrowed_byte_arguments(root: &mut general::Root) {
+    for namespace in root.namespaces.values_mut() {
+        let mut borrowed_arguments = HashMap::<String, Vec<usize>>::new();
+        for function in &mut namespace.functions {
+            let mut indices = Vec::new();
+            for (index, argument) in function.callable.arguments.iter_mut().enumerate() {
+                if argument.is_borrowed_bytes() {
+                    argument.ty.ffi_type = FfiType::ForeignBytes;
+                    indices.push(index);
+                }
+            }
+            if !indices.is_empty() {
+                borrowed_arguments.insert(function.callable.ffi_func.0.clone(), indices);
+            }
+        }
+
+        let definitions = std::mem::take(&mut namespace.ffi_definitions);
+        namespace.ffi_definitions = definitions
+            .into_iter()
+            .map(|mut definition| {
+                if let FfiDefinition::RustFunction(function) = &mut definition {
+                    if let Some(indices) = borrowed_arguments.get(&function.name.0) {
+                        for index in indices {
+                            function.arguments[*index].ty = FfiType::ForeignBytes;
+                        }
+                    }
+                }
+                definition
+            })
+            .collect();
+    }
 }
 
 fn render_namespace(
@@ -155,6 +190,15 @@ fn render_c_header(namespace: &Namespace, c_stem: &str) -> Result<String> {
             }
         }
     }
+    for definition in &namespace.type_definitions {
+        if let TypeDefinition::CallbackInterface(callback) = definition {
+            writeln!(
+                out,
+                "void {}(void);",
+                callback_installer_symbol(namespace, callback)
+            )?;
+        }
+    }
 
     writeln!(out)?;
     writeln!(out, "#endif")?;
@@ -216,7 +260,127 @@ fn render_c_source(namespace: &Namespace, header_name: &str) -> Result<String> {
             render_c_adapter_definition(&mut out, function)?;
         }
     }
+    for definition in &namespace.type_definitions {
+        if let TypeDefinition::CallbackInterface(callback) = definition {
+            render_c_callback_interface(&mut out, namespace, callback)?;
+        }
+    }
     Ok(out)
+}
+
+fn callback_symbol_prefix(namespace: &Namespace, callback: &general::CallbackInterface) -> String {
+    format!(
+        "hs_callback_{}_{}",
+        sanitize_identifier(&namespace.name),
+        sanitize_identifier(&callback.name)
+    )
+}
+
+fn callback_installer_symbol(
+    namespace: &Namespace,
+    callback: &general::CallbackInterface,
+) -> String {
+    format!("{}_install", callback_symbol_prefix(namespace, callback))
+}
+
+fn render_c_callback_interface(
+    out: &mut String,
+    namespace: &Namespace,
+    callback: &general::CallbackInterface,
+) -> Result<()> {
+    let struct_name = match &callback.vtable.struct_type {
+        FfiType::Struct(name) => &name.0,
+        other => bail!("callback vtable had unexpected type {other:?}"),
+    };
+    let struct_definition = namespace
+        .ffi_definitions
+        .iter()
+        .find_map(|definition| match definition {
+            FfiDefinition::Struct(struct_) if struct_.name.0 == *struct_name => Some(struct_),
+            _ => None,
+        })
+        .with_context(|| format!("missing callback vtable struct {struct_name}"))?;
+    let prefix = callback_symbol_prefix(namespace, callback);
+    let mut trampoline_names = Vec::new();
+
+    for field in &struct_definition.fields {
+        let function_name = match &field.ty {
+            FfiType::Function(name) => &name.0,
+            other => bail!("callback vtable field {} had type {other:?}", field.name),
+        };
+        let function_type = namespace
+            .ffi_definitions
+            .iter()
+            .find_map(|definition| match definition {
+                FfiDefinition::FunctionType(function) if function.name.0 == *function_name => {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .with_context(|| format!("missing callback function type {function_name}"))?;
+        let implementation_symbol = format!("{prefix}_{}", sanitize_identifier(&field.name));
+        let trampoline_symbol = format!("{implementation_symbol}_trampoline");
+        trampoline_names.push(trampoline_symbol.clone());
+        let return_type = c_return_type(function_type.return_type.ty.as_ref())?;
+        let haskell_arguments = c_raw_arguments(
+            &function_type.arguments,
+            function_type.has_rust_call_status_arg,
+            true,
+        )?;
+        let raw_arguments = c_raw_arguments(
+            &function_type.arguments,
+            function_type.has_rust_call_status_arg,
+            false,
+        )?;
+        writeln!(
+            out,
+            "extern {return_type} {implementation_symbol}({haskell_arguments});"
+        )?;
+        writeln!(
+            out,
+            "static {return_type} {trampoline_symbol}({raw_arguments}) {{"
+        )?;
+        let mut call_arguments = function_type
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                if is_by_value_struct(&argument.ty) {
+                    format!("&arg_{index}")
+                } else {
+                    format!("arg_{index}")
+                }
+            })
+            .collect::<Vec<_>>();
+        if function_type.has_rust_call_status_arg {
+            call_arguments.push("out_status".to_string());
+        }
+        let call = format!("{implementation_symbol}({})", call_arguments.join(", "));
+        if function_type.return_type.ty.is_some() {
+            writeln!(out, "    return {call};")?;
+        } else {
+            writeln!(out, "    {call};")?;
+        }
+        writeln!(out, "}}")?;
+        writeln!(out)?;
+    }
+
+    let vtable_symbol = format!("{prefix}_vtable");
+    writeln!(out, "static const {struct_name} {vtable_symbol} = {{")?;
+    for trampoline in &trampoline_names {
+        writeln!(out, "    {trampoline},")?;
+    }
+    writeln!(out, "}};")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "void {}(void) {{",
+        callback_installer_symbol(namespace, callback)
+    )?;
+    writeln!(out, "    {}(&{vtable_symbol});", callback.vtable.init_fn.0)?;
+    writeln!(out, "}}")?;
+    writeln!(out)?;
+    Ok(())
 }
 
 fn render_c_adapter_definition(out: &mut String, function: &FfiFunction) -> Result<()> {
@@ -346,17 +510,39 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "{{-# LANGUAGE DuplicateRecordFields #-}}")?;
     writeln!(out, "{{-# LANGUAGE ForeignFunctionInterface #-}}")?;
-    writeln!(out, "{{-# OPTIONS_GHC -Wno-unused-top-binds #-}}")?;
+    writeln!(out, "{{-# LANGUAGE TypeApplications #-}}")?;
+    writeln!(
+        out,
+        "{{-# OPTIONS_GHC -Wno-unused-imports -Wno-unused-top-binds #-}}"
+    )?;
     writeln!(out)?;
     writeln!(out, "module {module_name}")?;
     writeln!(out, "  ( initialize")?;
     for definition in &namespace.type_definitions {
         match definition {
             TypeDefinition::Record(record) => {
-                writeln!(out, "  , {} (..)", upper_camel(&record.name))?;
+                let type_name = upper_camel(&record.name);
+                writeln!(out, "  , {type_name} (..)")?;
+                writeln!(out, "  , encode{type_name}")?;
+                writeln!(out, "  , decode{type_name}")?;
+                if record.fields.iter().all(|field| field.default.is_some()) {
+                    writeln!(out, "  , default{type_name}")?;
+                }
             }
             TypeDefinition::Enum(enum_) => {
-                writeln!(out, "  , {} (..)", upper_camel(&enum_.name))?;
+                let type_name = upper_camel(&enum_.name);
+                writeln!(out, "  , {type_name} (..)")?;
+                writeln!(out, "  , encode{type_name}")?;
+                writeln!(out, "  , decode{type_name}")?;
+            }
+            TypeDefinition::Custom(custom) => {
+                let type_name = upper_camel(&custom.name);
+                writeln!(out, "  , {type_name} (..)")?;
+                writeln!(out, "  , encode{type_name}")?;
+                writeln!(out, "  , decode{type_name}")?;
+            }
+            TypeDefinition::CallbackInterface(callback) => {
+                writeln!(out, "  , {} (..)", upper_camel(&callback.name))?;
             }
             TypeDefinition::Interface(interface) => {
                 let type_name = upper_camel(&interface.name);
@@ -381,14 +567,30 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
         }
     }
     for function in &namespace.functions {
-        writeln!(out, "  , {}", haskell_value_name(&function.callable.name))?;
+        let function_name = haskell_value_name(&function.callable.name);
+        writeln!(out, "  , {function_name}")?;
+        if function
+            .callable
+            .arguments
+            .iter()
+            .any(|argument| argument.default.is_some())
+        {
+            writeln!(out, "  , {function_name}UsingDefaults")?;
+        }
     }
     writeln!(out, "  ) where")?;
     writeln!(out)?;
-    writeln!(out, "import Control.Exception (throwIO)")?;
+    writeln!(
+        out,
+        "import Control.Exception (SomeException, displayException, throwIO, try)"
+    )?;
     writeln!(out, "import Control.Monad (unless)")?;
     writeln!(out, "import Data.ByteString (ByteString)")?;
     writeln!(out, "import Data.Int (Int8, Int16, Int32, Int64)")?;
+    writeln!(out, "import Data.Map.Strict (Map)")?;
+    writeln!(out, "import qualified Data.Map.Strict as Map")?;
+    writeln!(out, "import Data.Set (Set)")?;
+    writeln!(out, "import qualified Data.Set as Set")?;
     writeln!(out, "import Data.Text (Text)")?;
     writeln!(out, "import qualified Data.Text as Text")?;
     writeln!(out, "import Data.Word (Word8, Word16, Word32, Word64)")?;
@@ -398,6 +600,16 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
     writeln!(out, "import Foreign.Storable (peek, poke)")?;
     writeln!(out, "import Prelude hiding (readList)")?;
     writeln!(out, "import UniFFI.Runtime")?;
+    for definition in &namespace.type_definitions {
+        if let TypeDefinition::External(external) = definition {
+            let external_module = upper_camel(&external.namespace);
+            let type_name = upper_camel(&external.name);
+            writeln!(
+                out,
+                "import UniFFI.{external_module} ({type_name} (..), decode{type_name}, encode{type_name})"
+            )?;
+        }
+    }
     writeln!(out)?;
 
     render_haskell_runtime_imports(&mut out, namespace)?;
@@ -405,8 +617,14 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
         render_haskell_ffi_import(&mut out, function)?;
     }
     for definition in &namespace.type_definitions {
-        if let TypeDefinition::Interface(interface) = definition {
-            render_haskell_interface_ffi_imports(&mut out, interface)?;
+        match definition {
+            TypeDefinition::Interface(interface) => {
+                render_haskell_interface_ffi_imports(&mut out, interface)?;
+            }
+            TypeDefinition::CallbackInterface(callback) => {
+                render_haskell_callback_ffi(&mut out, namespace, callback)?;
+            }
+            _ => {}
         }
     }
     writeln!(out)?;
@@ -422,6 +640,14 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
                 writeln!(out)?;
                 render_haskell_enum(&mut out, enum_)?;
             }
+            TypeDefinition::Custom(custom) => {
+                writeln!(out)?;
+                render_haskell_custom_type(&mut out, custom)?;
+            }
+            TypeDefinition::CallbackInterface(callback) => {
+                writeln!(out)?;
+                render_haskell_callback_interface(&mut out, namespace, callback)?;
+            }
             TypeDefinition::Interface(interface) => {
                 writeln!(out)?;
                 render_haskell_interface(&mut out, interface)?;
@@ -433,8 +659,380 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
     for function in &namespace.functions {
         writeln!(out)?;
         render_haskell_function(&mut out, function)?;
+        if function
+            .callable
+            .arguments
+            .iter()
+            .any(|argument| argument.default.is_some())
+        {
+            writeln!(out)?;
+            render_haskell_default_function(&mut out, function)?;
+        }
     }
     Ok(out)
+}
+
+fn lower_camel_type_name(type_name: &str) -> String {
+    let mut characters = type_name.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+fn callback_field_name(type_name: &str, method_name: &str) -> String {
+    format!(
+        "{}{}",
+        lower_camel_type_name(type_name),
+        upper_camel(method_name)
+    )
+}
+
+fn render_haskell_callback_ffi(
+    out: &mut String,
+    namespace: &Namespace,
+    callback: &general::CallbackInterface,
+) -> Result<()> {
+    let type_name = upper_camel(&callback.name);
+    let prefix = callback_symbol_prefix(namespace, callback);
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_install{type_name} :: IO ()",
+        callback_installer_symbol(namespace, callback)
+    )?;
+    writeln!(
+        out,
+        "foreign export ccall \"{prefix}_uniffi_free\" callback{type_name}Free :: Word64 -> IO ()"
+    )?;
+    writeln!(
+        out,
+        "foreign export ccall \"{prefix}_uniffi_clone\" callback{type_name}Clone :: Word64 -> IO Word64"
+    )?;
+    for method in &callback.methods {
+        let handler_name = format!("callback{type_name}{}", upper_camel(&method.callable.name));
+        let symbol = format!("{prefix}_{}", sanitize_identifier(&method.callable.name));
+        let mut signature = vec!["Word64".to_string()];
+        signature.extend(
+            method
+                .callable
+                .arguments
+                .iter()
+                .map(|argument| haskell_ffi_argument_type(&argument.ty.ffi_type))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        let out_type = match method.callable.return_type.ty.as_ref() {
+            Some(return_type) => {
+                format!("Ptr {}", haskell_ffi_pointee_type(&return_type.ffi_type)?)
+            }
+            None => "Ptr ()".to_string(),
+        };
+        signature.push(out_type);
+        signature.push("Ptr RustCallStatus".to_string());
+        signature.push("IO ()".to_string());
+        writeln!(
+            out,
+            "foreign export ccall \"{symbol}\" {handler_name} :: {}",
+            signature.join(" -> ")
+        )?;
+    }
+    Ok(())
+}
+
+fn render_haskell_callback_interface(
+    out: &mut String,
+    _namespace: &Namespace,
+    callback: &general::CallbackInterface,
+) -> Result<()> {
+    let type_name = upper_camel(&callback.name);
+    writeln!(out, "data {type_name} = {type_name}")?;
+    for (index, method) in callback.methods.iter().enumerate() {
+        let prefix = if index == 0 { "  {" } else { "  ," };
+        let mut signature = method
+            .callable
+            .arguments
+            .iter()
+            .map(haskell_argument_api_type)
+            .collect::<Result<Vec<_>>>()?;
+        let return_type = method
+            .callable
+            .return_type
+            .ty
+            .as_ref()
+            .map(|return_type| haskell_api_type(&return_type.ty))
+            .transpose()?
+            .unwrap_or_else(|| "()".to_string());
+        let io_result = match method.callable.throws_type.ty.as_ref() {
+            Some(error_type) => format!(
+                "IO (Either {} {return_type})",
+                haskell_api_type(&error_type.ty)?
+            ),
+            None => format!("IO ({return_type})"),
+        };
+        signature.push(io_result);
+        writeln!(
+            out,
+            "{prefix} {} :: {}",
+            callback_field_name(&type_name, &method.callable.name),
+            signature.join(" -> ")
+        )?;
+    }
+    writeln!(out, "  }}")?;
+    writeln!(out)?;
+    writeln!(out, "callback{type_name}Free :: Word64 -> IO ()")?;
+    writeln!(out, "callback{type_name}Free = freeCallbackHandle")?;
+    writeln!(out)?;
+    writeln!(out, "callback{type_name}Clone :: Word64 -> IO Word64")?;
+    writeln!(out, "callback{type_name}Clone = cloneCallbackHandle")?;
+
+    for method in &callback.methods {
+        writeln!(out)?;
+        render_haskell_callback_method(out, &type_name, method)?;
+    }
+    Ok(())
+}
+
+fn render_haskell_callback_method(
+    out: &mut String,
+    type_name: &str,
+    method: &general::Method,
+) -> Result<()> {
+    let callable = &method.callable;
+    if callable.async_data.is_some() {
+        bail!(
+            "async callback method {} is not supported yet",
+            callable.orig_name
+        );
+    }
+    let handler_name = format!("callback{type_name}{}", upper_camel(&callable.name));
+    let mut handler_signature = vec!["Word64".to_string()];
+    handler_signature.extend(
+        callable
+            .arguments
+            .iter()
+            .map(|argument| haskell_ffi_argument_type(&argument.ty.ffi_type))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    handler_signature.push(match callable.return_type.ty.as_ref() {
+        Some(return_type) => format!("Ptr {}", haskell_ffi_pointee_type(&return_type.ffi_type)?),
+        None => "Ptr ()".to_string(),
+    });
+    handler_signature.push("Ptr RustCallStatus".to_string());
+    handler_signature.push("IO ()".to_string());
+    writeln!(out, "{handler_name} :: {}", handler_signature.join(" -> "))?;
+    let ffi_argument_names: Vec<String> = (0..callable.arguments.len())
+        .map(|index| format!("ffiArg{index}"))
+        .collect();
+    let mut parameters = vec!["handle".to_string()];
+    parameters.extend(ffi_argument_names.iter().cloned());
+    parameters.push("outReturn".to_string());
+    parameters.push("statusPointer".to_string());
+    writeln!(out, "{handler_name} {} = do", parameters.join(" "))?;
+    writeln!(out, "  outcome <- try @SomeException $ do")?;
+    writeln!(
+        out,
+        "    callback <- dereferenceCallbackHandle handle :: IO {type_name}"
+    )?;
+    let mut lifted_names = Vec::new();
+    for ((argument, ffi_name), index) in callable
+        .arguments
+        .iter()
+        .zip(&ffi_argument_names)
+        .zip(0usize..)
+    {
+        let lifted_name = format!("argument{index}");
+        render_callback_argument_lift(
+            out,
+            "    ",
+            &argument.ty.ty,
+            &argument.ty.ffi_type,
+            ffi_name,
+            &lifted_name,
+        )?;
+        lifted_names.push(lifted_name);
+    }
+    let field_name = callback_field_name(type_name, &callable.name);
+    let call = if lifted_names.is_empty() {
+        format!("{field_name} callback")
+    } else {
+        format!("{field_name} callback {}", lifted_names.join(" "))
+    };
+    writeln!(out, "    {call}")?;
+    writeln!(out, "  case outcome of")?;
+    writeln!(
+        out,
+        "    Left exception -> setCallbackUnexpectedError c_rustBufferFromBytes c_rustBufferFree (displayException exception) statusPointer"
+    )?;
+    if let Some(error_type) = callable.throws_type.ty.as_ref() {
+        writeln!(out, "    Right (Left callbackError) ->")?;
+        writeln!(
+            out,
+            "      setCallbackError c_rustBufferFromBytes c_rustBufferFree (runEncoder ({})) statusPointer",
+            encoder_expression(&error_type.ty, "callbackError")?
+        )?;
+        writeln!(out, "    Right (Right callbackResult) -> do")?;
+        render_callback_result_lower(
+            out,
+            "      ",
+            callable
+                .return_type
+                .ty
+                .as_ref()
+                .map(|return_type| &return_type.ty),
+            "callbackResult",
+            "outReturn",
+        )?;
+    } else {
+        writeln!(out, "    Right callbackResult -> do")?;
+        render_callback_result_lower(
+            out,
+            "      ",
+            callable
+                .return_type
+                .ty
+                .as_ref()
+                .map(|return_type| &return_type.ty),
+            "callbackResult",
+            "outReturn",
+        )?;
+    }
+    Ok(())
+}
+
+fn render_callback_argument_lift(
+    out: &mut String,
+    indent: &str,
+    api_type: &Type,
+    ffi_type: &FfiType,
+    ffi_name: &str,
+    lifted_name: &str,
+) -> Result<()> {
+    match ffi_type {
+        FfiType::RustBuffer(_) => {
+            writeln!(out, "{indent}{lifted_name}Buffer <- peek {ffi_name}")?;
+            writeln!(
+                out,
+                "{indent}{lifted_name}Bytes <- consumeRustBuffer c_rustBufferFree {lifted_name}Buffer"
+            )?;
+            match api_type {
+                Type::String => {
+                    writeln!(out, "{indent}{lifted_name} <-")?;
+                    writeln!(out, "{indent}  case decodeUtf8 {lifted_name}Bytes of")?;
+                    writeln!(
+                        out,
+                        "{indent}    Left err -> throwIO (UniFFIException (Text.pack (show err)))"
+                    )?;
+                    writeln!(out, "{indent}    Right value -> pure value")?;
+                }
+                other => writeln!(
+                    out,
+                    "{indent}{lifted_name} <- runDecoder ({}) {lifted_name}Bytes",
+                    decoder_expression(other)?
+                )?,
+            }
+        }
+        _ => match api_type {
+            Type::Boolean => {
+                writeln!(out, "{indent}{lifted_name} <-")?;
+                writeln!(out, "{indent}  case {ffi_name} of")?;
+                writeln!(out, "{indent}    0 -> pure False")?;
+                writeln!(out, "{indent}    1 -> pure True")?;
+                writeln!(
+                    out,
+                    "{indent}    other -> throwIO (UniFFIException (Text.pack (show other)))"
+                )?;
+            }
+            _ => writeln!(out, "{indent}let {lifted_name} = {ffi_name}")?,
+        },
+    }
+    Ok(())
+}
+
+fn render_callback_result_lower(
+    out: &mut String,
+    indent: &str,
+    return_type: Option<&Type>,
+    value: &str,
+    out_pointer: &str,
+) -> Result<()> {
+    match return_type {
+        None => writeln!(out, "{indent}pure ()")?,
+        Some(Type::Boolean) => {
+            writeln!(out, "{indent}poke {out_pointer} (if {value} then 1 else 0)")?
+        }
+        Some(Type::String) => {
+            writeln!(
+                out,
+                "{indent}buffer <- lowerRustBuffer c_rustBufferFromBytes c_rustBufferFree (encodeUtf8 {value})"
+            )?;
+            writeln!(out, "{indent}poke {out_pointer} buffer")?;
+        }
+        Some(
+            ty @ (Type::Bytes
+            | Type::Optional { .. }
+            | Type::Sequence { .. }
+            | Type::Map { .. }
+            | Type::Set { .. }
+            | Type::Timestamp
+            | Type::Duration
+            | Type::Box { .. }
+            | Type::Record { .. }
+            | Type::Enum { .. }
+            | Type::Custom { .. }),
+        ) => {
+            writeln!(
+                out,
+                "{indent}buffer <- lowerRustBuffer c_rustBufferFromBytes c_rustBufferFree (runEncoder ({}))",
+                encoder_expression(ty, value)?
+            )?;
+            writeln!(out, "{indent}poke {out_pointer} buffer")?;
+        }
+        Some(
+            Type::UInt8
+            | Type::Int8
+            | Type::UInt16
+            | Type::Int16
+            | Type::UInt32
+            | Type::Int32
+            | Type::UInt64
+            | Type::Int64
+            | Type::Float32
+            | Type::Float64,
+        ) => writeln!(out, "{indent}poke {out_pointer} {value}")?,
+        Some(other) => bail!("callback return lowering for {other:?} is not supported yet"),
+    }
+    Ok(())
+}
+
+fn render_haskell_custom_type(out: &mut String, custom: &general::CustomType) -> Result<()> {
+    let type_name = upper_camel(&custom.name);
+    writeln!(
+        out,
+        "newtype {type_name} = {type_name} {}",
+        haskell_api_type(&custom.builtin.ty)?
+    )?;
+    writeln!(out, "  deriving (Eq, Ord, Show)")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "unwrap{type_name} :: {type_name} -> {}",
+        haskell_api_type(&custom.builtin.ty)?
+    )?;
+    writeln!(out, "unwrap{type_name} ({type_name} value) = value")?;
+    writeln!(out)?;
+    writeln!(out, "encode{type_name} :: {type_name} -> Encoder")?;
+    writeln!(
+        out,
+        "encode{type_name} ({type_name} value) = {}",
+        encoder_expression(&custom.builtin.ty, "value")?
+    )?;
+    writeln!(out)?;
+    writeln!(out, "decode{type_name} :: Decoder {type_name}")?;
+    writeln!(
+        out,
+        "decode{type_name} = {type_name} <$> {}",
+        decoder_expression(&custom.builtin.ty)?
+    )?;
+    Ok(())
 }
 
 fn render_haskell_interface_ffi_imports(
@@ -477,10 +1075,13 @@ fn render_haskell_object_callable_ffi_import(
     binding_name: &str,
     has_receiver: bool,
 ) -> Result<()> {
-    if callable.async_data.is_some() || callable.throws_type.ty.is_some() {
-        bail!(
-            "async or throwing object callable {} is not supported yet",
-            callable.orig_name
+    if let Some(async_data) = callable.async_data.as_ref() {
+        return render_haskell_async_ffi_import_named(
+            out,
+            callable,
+            async_data,
+            binding_name,
+            has_receiver,
         );
     }
     let mut parts = Vec::new();
@@ -567,7 +1168,7 @@ fn render_haskell_constructor(
     let mut signature = callable
         .arguments
         .iter()
-        .map(|argument| haskell_api_type(&argument.ty.ty))
+        .map(haskell_argument_api_type)
         .collect::<Result<Vec<_>>>()?;
     signature.push(format!("IO {type_name}"));
     writeln!(out, "{function_name} :: {}", signature.join(" -> "))?;
@@ -614,7 +1215,7 @@ fn render_haskell_method(
         callable
             .arguments
             .iter()
-            .map(|argument| haskell_api_type(&argument.ty.ty))
+            .map(haskell_argument_api_type)
             .collect::<Result<Vec<_>>>()?,
     );
     let result_type = callable
@@ -624,14 +1225,79 @@ fn render_haskell_method(
         .map(|return_type| haskell_api_type(&return_type.ty))
         .transpose()?
         .unwrap_or_else(|| "()".to_string());
-    signature.push(format!("IO ({result_type})"));
+    let io_result = match callable.throws_type.ty.as_ref() {
+        Some(error_type) => format!(
+            "IO (Either {} {result_type})",
+            haskell_api_type(&error_type.ty)?
+        ),
+        None => format!("IO ({result_type})"),
+    };
+    signature.push(io_result);
     writeln!(out, "{function_name} :: {}", signature.join(" -> "))?;
     let all_arguments = std::iter::once("object".to_string())
         .chain(argument_names.iter().cloned())
         .collect::<Vec<_>>();
     writeln!(out, "{function_name} {} = do", all_arguments.join(" "))?;
     writeln!(out, "  initialize")?;
+    for (argument, name) in callable.arguments.iter().zip(&argument_names) {
+        if matches!(argument.ty.ty, Type::CallbackInterface { .. }) {
+            writeln!(out, "  callback_{name}_handle <- newCallbackHandle {name}")?;
+        }
+        if let Type::Interface {
+            name: interface_name,
+            ..
+        } = &argument.ty.ty
+        {
+            writeln!(
+                out,
+                "  object_{name}_handle <- clone{}Handle {name}",
+                upper_camel(interface_name)
+            )?;
+        }
+        if matches!(argument.ty.ffi_type, FfiType::RustBuffer(_)) {
+            let encoded = match &argument.ty.ty {
+                Type::String => format!("encodeUtf8 {name}"),
+                other => {
+                    writeln!(
+                        out,
+                        "  let serialized_{name} = runEncoder ({})",
+                        encoder_expression(other, name)?
+                    )?;
+                    format!("serialized_{name}")
+                }
+            };
+            writeln!(
+                out,
+                "  lowered_{name} <- lowerRustBuffer c_rustBufferFromBytes c_rustBufferFree ({encoded})"
+            )?;
+        }
+    }
     writeln!(out, "  clonedHandle <- clone{type_name}Handle object")?;
+    let mut indent = "  ".to_string();
+    for (argument, name) in callable.arguments.iter().zip(&argument_names) {
+        match &argument.ty.ffi_type {
+            FfiType::RustBuffer(_) => {
+                writeln!(
+                    out,
+                    "{indent}with lowered_{name} $ \\lowered_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            FfiType::ForeignBytes => {
+                let with_function = if is_mutable_borrowed_bytes(argument) {
+                    "withMutableForeignBytes"
+                } else {
+                    "withForeignBytes"
+                };
+                writeln!(
+                    out,
+                    "{indent}{with_function} {name} $ \\borrowed_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            _ => {}
+        }
+    }
     let mut lowered = vec!["clonedHandle".to_string()];
     lowered.extend(
         callable
@@ -643,27 +1309,79 @@ fn render_haskell_method(
             })
             .collect::<Result<Vec<_>>>()?,
     );
-    let args = append_call_arguments(&lowered, &["statusPtr"]);
-    let return_binding = if callable.return_type.ty.is_some() {
-        "returnValue"
-    } else {
-        "_"
-    };
-    writeln!(out, "  ({return_binding}, status) <-")?;
-    writeln!(out, "    withRustCallStatus $ \\statusPtr ->")?;
-    writeln!(out, "      c_{function_name} {args}")?;
-    writeln!(out, "  checkRustCallStatus c_rustBufferFree status")?;
-    render_lift_scalar(
-        out,
-        "  ",
-        callable
-            .return_type
-            .ty
-            .as_ref()
-            .map(|return_type| &return_type.ty),
-        "returnValue",
-        false,
-    )?;
+    if callable.async_data.is_some() {
+        render_haskell_async_body(out, callable, &function_name, &lowered, &indent)?;
+        return Ok(());
+    }
+    match callable.return_type.ty.as_ref() {
+        Some(return_type) if is_by_value_struct(&return_type.ffi_type) => {
+            writeln!(out, "{indent}alloca $ \\returnPtr -> do")?;
+            let inner = format!("{indent}  ");
+            writeln!(out, "{inner}poke returnPtr emptyRustBuffer")?;
+            let args = append_call_arguments(&lowered, &["returnPtr", "statusPtr"]);
+            writeln!(out, "{inner}(_, status) <-")?;
+            writeln!(out, "{inner}  withRustCallStatus $ \\statusPtr ->")?;
+            writeln!(out, "{inner}    c_{function_name} {args}")?;
+            let success_indent = if let Some(error_type) = callable.throws_type.ty.as_ref() {
+                writeln!(
+                    out,
+                    "{inner}callError <- checkRustCallStatusWithError c_rustBufferFree ({}) status",
+                    decoder_expression(&error_type.ty)?
+                )?;
+                writeln!(out, "{inner}case callError of")?;
+                writeln!(out, "{inner}  Just err -> pure (Left err)")?;
+                writeln!(out, "{inner}  Nothing -> do")?;
+                format!("{inner}    ")
+            } else {
+                writeln!(out, "{inner}checkRustCallStatus c_rustBufferFree status")?;
+                inner.clone()
+            };
+            writeln!(out, "{success_indent}returnBuffer <- peek returnPtr")?;
+            writeln!(
+                out,
+                "{success_indent}returnBytes <- consumeRustBuffer c_rustBufferFree returnBuffer"
+            )?;
+            render_lift_buffer(
+                out,
+                &success_indent,
+                &return_type.ty,
+                "returnBytes",
+                callable.throws_type.ty.is_some(),
+            )?;
+        }
+        return_type => {
+            let args = append_call_arguments(&lowered, &["statusPtr"]);
+            let return_binding = if return_type.is_some() {
+                "returnValue"
+            } else {
+                "_"
+            };
+            writeln!(out, "{indent}({return_binding}, status) <-")?;
+            writeln!(out, "{indent}  withRustCallStatus $ \\statusPtr ->")?;
+            writeln!(out, "{indent}    c_{function_name} {args}")?;
+            let success_indent = if let Some(error_type) = callable.throws_type.ty.as_ref() {
+                writeln!(
+                    out,
+                    "{indent}callError <- checkRustCallStatusWithError c_rustBufferFree ({}) status",
+                    decoder_expression(&error_type.ty)?
+                )?;
+                writeln!(out, "{indent}case callError of")?;
+                writeln!(out, "{indent}  Just err -> pure (Left err)")?;
+                writeln!(out, "{indent}  Nothing -> do")?;
+                format!("{indent}    ")
+            } else {
+                writeln!(out, "{indent}checkRustCallStatus c_rustBufferFree status")?;
+                indent.clone()
+            };
+            render_lift_scalar(
+                out,
+                &success_indent,
+                return_type.map(|return_type| &return_type.ty),
+                "returnValue",
+                callable.throws_type.ty.is_some(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -681,7 +1399,7 @@ fn haskell_constructor_name(type_name: &str, constructor: &general::Constructor)
 fn haskell_method_name(type_name: &str, method_name: &str) -> String {
     format!(
         "{}{}",
-        haskell_value_name(type_name),
+        lower_camel_type_name(type_name),
         upper_camel(method_name)
     )
 }
@@ -708,6 +1426,24 @@ fn render_haskell_record(out: &mut String, record: &general::Record) -> Result<(
         FieldsKind::Unnamed => bail!("unnamed record {} is not supported", record.orig_name),
     }
     writeln!(out, "  deriving (Eq, Show)")?;
+    if record.fields.iter().all(|field| field.default.is_some()) {
+        writeln!(out)?;
+        writeln!(out, "default{type_name} :: {type_name}")?;
+        let defaults = record
+            .fields
+            .iter()
+            .map(|field| render_default_value(field.default.as_ref().expect("checked above")))
+            .collect::<Result<Vec<_>>>()?;
+        if defaults.is_empty() {
+            writeln!(out, "default{type_name} = {type_name}")?;
+        } else {
+            writeln!(
+                out,
+                "default{type_name} = {type_name} {}",
+                defaults.join(" ")
+            )?;
+        }
+    }
     writeln!(out)?;
     writeln!(out, "encode{type_name} :: {type_name} -> Encoder")?;
     if record.fields.is_empty() {
@@ -871,7 +1607,22 @@ fn encoder_expression(ty: &Type, value: &str) -> Result<String> {
                 encoder_expression(inner_type, "item")?
             )
         }
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!(
+            "writeMap (\\key -> {}) (\\item -> {}) {value}",
+            encoder_expression(key_type, "key")?,
+            encoder_expression(value_type, "item")?
+        ),
+        Type::Set { inner_type } => format!(
+            "writeSet (\\item -> {}) {value}",
+            encoder_expression(inner_type, "item")?
+        ),
+        Type::Timestamp => format!("writeTimestamp {value}"),
+        Type::Duration => format!("writeDuration {value}"),
+        Type::Box { inner_type } => encoder_expression(inner_type, value)?,
+        Type::Record { name, .. } | Type::Enum { name, .. } | Type::Custom { name, .. } => {
             format!("encode{} {value}", upper_camel(name))
         }
         other => bail!("encoding {other:?} is not supported yet"),
@@ -895,7 +1646,19 @@ fn decoder_expression(ty: &Type) -> Result<String> {
         Type::Bytes => "readBytes".to_string(),
         Type::Optional { inner_type } => format!("readMaybe ({})", decoder_expression(inner_type)?),
         Type::Sequence { inner_type } => format!("readList ({})", decoder_expression(inner_type)?),
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!(
+            "readMap ({}) ({})",
+            decoder_expression(key_type)?,
+            decoder_expression(value_type)?
+        ),
+        Type::Set { inner_type } => format!("readSet ({})", decoder_expression(inner_type)?),
+        Type::Timestamp => "readTimestamp".to_string(),
+        Type::Duration => "readDuration".to_string(),
+        Type::Box { inner_type } => decoder_expression(inner_type)?,
+        Type::Record { name, .. } | Type::Enum { name, .. } | Type::Custom { name, .. } => {
             format!("decode{}", upper_camel(name))
         }
         other => bail!("decoding {other:?} is not supported yet"),
@@ -928,10 +1691,85 @@ fn render_haskell_runtime_imports(out: &mut String, namespace: &Namespace) -> Re
     Ok(())
 }
 
+fn render_haskell_async_ffi_import(
+    out: &mut String,
+    callable: &general::Callable,
+    async_data: &general::AsyncData,
+) -> Result<()> {
+    render_haskell_async_ffi_import_named(
+        out,
+        callable,
+        async_data,
+        &haskell_value_name(&callable.name),
+        false,
+    )
+}
+
+fn render_haskell_async_ffi_import_named(
+    out: &mut String,
+    callable: &general::Callable,
+    async_data: &general::AsyncData,
+    function_name: &str,
+    has_receiver: bool,
+) -> Result<()> {
+    let mut start_parts = Vec::new();
+    if has_receiver {
+        start_parts.push("Word64".to_string());
+    }
+    start_parts.extend(
+        callable
+            .arguments
+            .iter()
+            .map(|argument| haskell_ffi_argument_type(&argument.ty.ffi_type))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    start_parts.push("IO Word64".to_string());
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_{function_name}_start :: {}",
+        adapter_symbol(&callable.ffi_func.0),
+        start_parts.join(" -> ")
+    )?;
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_{function_name}_poll :: RustFuturePoll",
+        adapter_symbol(&async_data.ffi_rust_future_poll.0)
+    )?;
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_{function_name}_cancel :: RustFutureCancel",
+        adapter_symbol(&async_data.ffi_rust_future_cancel.0)
+    )?;
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_{function_name}_free :: RustFutureFree",
+        adapter_symbol(&async_data.ffi_rust_future_free.0)
+    )?;
+    let complete_type = match callable.return_type.ty.as_ref() {
+        Some(return_type) if is_by_value_struct(&return_type.ffi_type) => {
+            format!(
+                "Word64 -> Ptr {} -> Ptr RustCallStatus -> IO ()",
+                haskell_ffi_struct_type(&return_type.ffi_type)?
+            )
+        }
+        Some(return_type) => format!(
+            "Word64 -> Ptr RustCallStatus -> IO {}",
+            haskell_ffi_scalar_type(&return_type.ffi_type)?
+        ),
+        None => "Word64 -> Ptr RustCallStatus -> IO ()".to_string(),
+    };
+    writeln!(
+        out,
+        "foreign import ccall safe \"{}\" c_{function_name}_complete :: {complete_type}",
+        adapter_symbol(&async_data.ffi_rust_future_complete.0)
+    )?;
+    Ok(())
+}
+
 fn render_haskell_ffi_import(out: &mut String, function: &general::Function) -> Result<()> {
     let callable = &function.callable;
-    if callable.async_data.is_some() {
-        bail!("async function {} is not supported yet", callable.orig_name);
+    if let Some(async_data) = callable.async_data.as_ref() {
+        return render_haskell_async_ffi_import(out, callable, async_data);
     }
 
     let mut parts = Vec::new();
@@ -991,7 +1829,133 @@ fn render_initialize(out: &mut String, namespace: &Namespace) -> Result<()> {
             checksum.checksum
         )?;
     }
+    for definition in &namespace.type_definitions {
+        if let TypeDefinition::CallbackInterface(callback) = definition {
+            writeln!(out, "  c_install{}", upper_camel(&callback.name))?;
+        }
+    }
     Ok(())
+}
+
+fn render_haskell_default_function(out: &mut String, function: &general::Function) -> Result<()> {
+    let callable = &function.callable;
+    let function_name = haskell_value_name(&callable.name);
+    let required_arguments: Vec<_> = callable
+        .arguments
+        .iter()
+        .filter(|argument| argument.default.is_none())
+        .collect();
+    let mut signature = required_arguments
+        .iter()
+        .map(|argument| haskell_argument_api_type(argument))
+        .collect::<Result<Vec<_>>>()?;
+    let result_type = callable
+        .return_type
+        .ty
+        .as_ref()
+        .map(|return_type| haskell_api_type(&return_type.ty))
+        .transpose()?
+        .unwrap_or_else(|| "()".to_string());
+    let io_result_type = match callable.throws_type.ty.as_ref() {
+        Some(error_type) => format!(
+            "IO (Either {} {result_type})",
+            haskell_api_type(&error_type.ty)?
+        ),
+        None => format!("IO ({result_type})"),
+    };
+    signature.push(io_result_type);
+    writeln!(
+        out,
+        "{function_name}UsingDefaults :: {}",
+        signature.join(" -> ")
+    )?;
+    let required_names: Vec<String> = required_arguments
+        .iter()
+        .map(|argument| haskell_value_name(&argument.name))
+        .collect();
+    if required_names.is_empty() {
+        writeln!(out, "{function_name}UsingDefaults =")?;
+    } else {
+        writeln!(
+            out,
+            "{function_name}UsingDefaults {} =",
+            required_names.join(" ")
+        )?;
+    }
+    let call_arguments = callable
+        .arguments
+        .iter()
+        .map(|argument| match &argument.default {
+            Some(default) => render_default_value(default),
+            None => Ok(haskell_value_name(&argument.name)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    writeln!(out, "  {function_name} {}", call_arguments.join(" "))?;
+    Ok(())
+}
+
+fn render_default_value(default: &general::DefaultValue) -> Result<String> {
+    match default {
+        general::DefaultValue::Literal(literal) => render_default_literal(literal),
+        general::DefaultValue::Default(type_node) => default_for_type(&type_node.ty),
+    }
+}
+
+fn render_default_literal(literal: &general::Literal) -> Result<String> {
+    Ok(match literal {
+        general::Literal::Boolean(value) => {
+            if *value {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        general::Literal::String(value) => format!("Text.pack {value:?}"),
+        general::Literal::UInt(value, _, _) => value.to_string(),
+        general::Literal::Int(value, _, _) => value.to_string(),
+        general::Literal::Float(value, _) => value.clone(),
+        general::Literal::Enum(variant, type_node) => format!(
+            "{}{}",
+            haskell_api_type(&type_node.ty)?,
+            upper_camel(variant)
+        ),
+        general::Literal::EmptySequence => "[]".to_string(),
+        general::Literal::EmptyMap => "Map.empty".to_string(),
+        general::Literal::EmptySet => "Set.empty".to_string(),
+        general::Literal::None => "Nothing".to_string(),
+        general::Literal::Some { inner } => {
+            format!("Just ({})", render_default_value(inner)?)
+        }
+    })
+}
+
+fn default_for_type(ty: &Type) -> Result<String> {
+    Ok(match ty {
+        Type::UInt8
+        | Type::Int8
+        | Type::UInt16
+        | Type::Int16
+        | Type::UInt32
+        | Type::Int32
+        | Type::UInt64
+        | Type::Int64
+        | Type::Float32
+        | Type::Float64 => "0".to_string(),
+        Type::Boolean => "False".to_string(),
+        Type::String => "Text.empty".to_string(),
+        Type::Bytes => "mempty".to_string(),
+        Type::Optional { .. } => "Nothing".to_string(),
+        Type::Sequence { .. } => "[]".to_string(),
+        Type::Map { .. } => "Map.empty".to_string(),
+        Type::Set { .. } => "Set.empty".to_string(),
+        Type::Duration => "Duration 0 0".to_string(),
+        Type::Box { inner_type } => default_for_type(inner_type)?,
+        Type::Custom { name, builtin, .. } => {
+            format!("{} ({})", upper_camel(name), default_for_type(builtin)?)
+        }
+        Type::Record { name, .. } => format!("default{}", upper_camel(name)),
+        other => bail!("default value for {other:?} is not supported yet"),
+    })
 }
 
 fn render_haskell_function(out: &mut String, function: &general::Function) -> Result<()> {
@@ -1005,7 +1969,7 @@ fn render_haskell_function(out: &mut String, function: &general::Function) -> Re
     let mut signature_parts: Vec<String> = callable
         .arguments
         .iter()
-        .map(|argument| haskell_api_type(&argument.ty.ty))
+        .map(haskell_argument_api_type)
         .collect::<Result<_>>()?;
     let result_type = match callable.return_type.ty.as_ref() {
         Some(ty) => haskell_api_type(&ty.ty)?,
@@ -1028,7 +1992,24 @@ fn render_haskell_function(out: &mut String, function: &general::Function) -> Re
     writeln!(out, "  initialize")?;
 
     for (argument, name) in callable.arguments.iter().zip(&argument_names) {
-        if is_by_value_struct(&argument.ty.ffi_type) {
+        if matches!(argument.ty.ty, Type::CallbackInterface { .. }) {
+            writeln!(out, "  callback_{name}_handle <- newCallbackHandle {name}")?;
+        }
+        if let Type::Interface {
+            name: interface_name,
+            ..
+        } = &argument.ty.ty
+        {
+            writeln!(
+                out,
+                "  object_{name}_handle <- clone{}Handle {name}",
+                upper_camel(interface_name)
+            )?;
+        }
+    }
+
+    for (argument, name) in callable.arguments.iter().zip(&argument_names) {
+        if matches!(argument.ty.ffi_type, FfiType::RustBuffer(_)) {
             let encoded = match &argument.ty.ty {
                 Type::String => format!("encodeUtf8 {name}"),
                 other => {
@@ -1047,20 +2028,30 @@ fn render_haskell_function(out: &mut String, function: &general::Function) -> Re
         }
     }
 
-    let buffer_arguments: Vec<String> = callable
-        .arguments
-        .iter()
-        .zip(&argument_names)
-        .filter(|(argument, _)| is_by_value_struct(&argument.ty.ffi_type))
-        .map(|(_, name)| name.clone())
-        .collect();
     let mut indent = "  ".to_string();
-    for name in &buffer_arguments {
-        writeln!(
-            out,
-            "{indent}with lowered_{name} $ \\lowered_{name}_ptr -> do"
-        )?;
-        indent.push_str("  ");
+    for (argument, name) in callable.arguments.iter().zip(&argument_names) {
+        match &argument.ty.ffi_type {
+            FfiType::RustBuffer(_) => {
+                writeln!(
+                    out,
+                    "{indent}with lowered_{name} $ \\lowered_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            FfiType::ForeignBytes => {
+                let with_function = if is_mutable_borrowed_bytes(argument) {
+                    "withMutableForeignBytes"
+                } else {
+                    "withForeignBytes"
+                };
+                writeln!(
+                    out,
+                    "{indent}{with_function} {name} $ \\borrowed_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            _ => {}
+        }
     }
 
     let mut ffi_arguments = Vec::new();
@@ -1070,6 +2061,11 @@ fn render_haskell_function(out: &mut String, function: &general::Function) -> Re
             &argument.ty.ffi_type,
             name,
         )?);
+    }
+
+    if callable.async_data.is_some() {
+        render_haskell_async_body(out, callable, &function_name, &ffi_arguments, &indent)?;
+        return Ok(());
     }
 
     match callable.return_type.ty.as_ref() {
@@ -1148,6 +2144,108 @@ fn render_haskell_function(out: &mut String, function: &general::Function) -> Re
     Ok(())
 }
 
+fn render_haskell_async_body(
+    out: &mut String,
+    callable: &general::Callable,
+    function_name: &str,
+    ffi_arguments: &[String],
+    indent: &str,
+) -> Result<()> {
+    let start_call = if ffi_arguments.is_empty() {
+        format!("c_{function_name}_start")
+    } else {
+        format!("c_{function_name}_start {}", ffi_arguments.join(" "))
+    };
+    writeln!(out, "{indent}runRustFuture")?;
+    writeln!(out, "{indent}  ({start_call})")?;
+    writeln!(out, "{indent}  c_{function_name}_poll")?;
+    writeln!(out, "{indent}  c_{function_name}_cancel")?;
+    writeln!(out, "{indent}  c_{function_name}_free")?;
+    writeln!(out, "{indent}  $ \\futureHandle -> do")?;
+    let inner = format!("{indent}    ");
+
+    match callable.return_type.ty.as_ref() {
+        Some(return_type) if is_by_value_struct(&return_type.ffi_type) => {
+            writeln!(out, "{inner}alloca $ \\returnPtr -> do")?;
+            let complete_indent = format!("{inner}  ");
+            writeln!(out, "{complete_indent}poke returnPtr emptyRustBuffer")?;
+            writeln!(out, "{complete_indent}(_, status) <-")?;
+            writeln!(
+                out,
+                "{complete_indent}  withRustCallStatus $ \\statusPtr ->"
+            )?;
+            writeln!(
+                out,
+                "{complete_indent}    c_{function_name}_complete futureHandle returnPtr statusPtr"
+            )?;
+            let success_indent = if let Some(error_type) = callable.throws_type.ty.as_ref() {
+                writeln!(
+                    out,
+                    "{complete_indent}callError <- checkRustCallStatusWithError c_rustBufferFree ({}) status",
+                    decoder_expression(&error_type.ty)?
+                )?;
+                writeln!(out, "{complete_indent}case callError of")?;
+                writeln!(out, "{complete_indent}  Just err -> pure (Left err)")?;
+                writeln!(out, "{complete_indent}  Nothing -> do")?;
+                format!("{complete_indent}    ")
+            } else {
+                writeln!(
+                    out,
+                    "{complete_indent}checkRustCallStatus c_rustBufferFree status"
+                )?;
+                complete_indent.clone()
+            };
+            writeln!(out, "{success_indent}returnBuffer <- peek returnPtr")?;
+            writeln!(
+                out,
+                "{success_indent}returnBytes <- consumeRustBuffer c_rustBufferFree returnBuffer"
+            )?;
+            render_lift_buffer(
+                out,
+                &success_indent,
+                &return_type.ty,
+                "returnBytes",
+                callable.throws_type.ty.is_some(),
+            )?;
+        }
+        return_type => {
+            let return_binding = if return_type.is_some() {
+                "returnValue"
+            } else {
+                "_"
+            };
+            writeln!(out, "{inner}({return_binding}, status) <-")?;
+            writeln!(out, "{inner}  withRustCallStatus $ \\statusPtr ->")?;
+            writeln!(
+                out,
+                "{inner}    c_{function_name}_complete futureHandle statusPtr"
+            )?;
+            let success_indent = if let Some(error_type) = callable.throws_type.ty.as_ref() {
+                writeln!(
+                    out,
+                    "{inner}callError <- checkRustCallStatusWithError c_rustBufferFree ({}) status",
+                    decoder_expression(&error_type.ty)?
+                )?;
+                writeln!(out, "{inner}case callError of")?;
+                writeln!(out, "{inner}  Just err -> pure (Left err)")?;
+                writeln!(out, "{inner}  Nothing -> do")?;
+                format!("{inner}    ")
+            } else {
+                writeln!(out, "{inner}checkRustCallStatus c_rustBufferFree status")?;
+                inner.clone()
+            };
+            render_lift_scalar(
+                out,
+                &success_indent,
+                return_type.map(|return_type| &return_type.ty),
+                "returnValue",
+                callable.throws_type.ty.is_some(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn append_call_arguments(arguments: &[String], trailing: &[&str]) -> String {
     arguments
         .iter()
@@ -1158,11 +2256,29 @@ fn append_call_arguments(arguments: &[String], trailing: &[&str]) -> String {
 }
 
 fn lower_argument_expression(api_type: &Type, ffi_type: &FfiType, name: &str) -> Result<String> {
-    if is_by_value_struct(ffi_type) {
-        return Ok(format!("lowered_{name}_ptr"));
+    match ffi_type {
+        FfiType::RustBuffer(_) => return Ok(format!("lowered_{name}_ptr")),
+        FfiType::ForeignBytes => return Ok(format!("borrowed_{name}_ptr")),
+        _ => {}
     }
     Ok(match api_type {
         Type::Boolean => format!("(if {name} then 1 else 0)"),
+        Type::Custom {
+            name: type_name,
+            builtin,
+            ..
+        } => {
+            return lower_argument_expression(
+                builtin,
+                ffi_type,
+                &format!("(unwrap{} {name})", upper_camel(type_name)),
+            );
+        }
+        Type::Box { inner_type } => {
+            return lower_argument_expression(inner_type, ffi_type, name);
+        }
+        Type::CallbackInterface { .. } => format!("callback_{name}_handle"),
+        Type::Interface { .. } => format!("object_{name}_handle"),
         Type::UInt8
         | Type::Int8
         | Type::UInt16
@@ -1235,6 +2351,30 @@ fn render_lift_scalar(
                 "{indent}  other -> throwIO (UniFFIException (Text.pack (\"invalid boolean from Rust: \" ++ show other)))"
             )?;
         }
+        Some(Type::Interface { name, .. }) if wrap_either => {
+            let type_name = upper_camel(name);
+            writeln!(
+                out,
+                "{indent}objectResult <- {type_name} <$> newRustObject {value} release{type_name}"
+            )?;
+            writeln!(out, "{indent}pure (Right objectResult)")?;
+        }
+        Some(Type::Interface { name, .. }) => {
+            let type_name = upper_camel(name);
+            writeln!(
+                out,
+                "{indent}{type_name} <$> newRustObject {value} release{type_name}"
+            )?;
+        }
+        Some(Type::Custom { name, .. }) if wrap_either => {
+            writeln!(out, "{indent}pure (Right ({} {value}))", upper_camel(name))?
+        }
+        Some(Type::Custom { name, .. }) => {
+            writeln!(out, "{indent}pure ({} {value})", upper_camel(name))?
+        }
+        Some(Type::Box { inner_type }) => {
+            return render_lift_scalar(out, indent, Some(inner_type), value, wrap_either);
+        }
         Some(
             Type::UInt8
             | Type::Int8
@@ -1264,6 +2404,18 @@ fn render_lift_scalar(
     Ok(())
 }
 
+fn is_mutable_borrowed_bytes(_argument: &general::Argument) -> bool {
+    false
+}
+
+fn haskell_argument_api_type(argument: &general::Argument) -> Result<String> {
+    if is_mutable_borrowed_bytes(argument) {
+        Ok("MutableBytes".to_string())
+    } else {
+        haskell_api_type(&argument.ty.ty)
+    }
+}
+
 fn haskell_api_type(ty: &Type) -> Result<String> {
     Ok(match ty {
         Type::UInt8 => "Word8".to_string(),
@@ -1283,16 +2435,44 @@ fn haskell_api_type(ty: &Type) -> Result<String> {
             format!("Maybe {}", parenthesized_haskell_type(inner_type)?)
         }
         Type::Sequence { inner_type } => format!("[{}]", haskell_api_type(inner_type)?),
-        Type::Interface { name, .. } | Type::Record { name, .. } | Type::Enum { name, .. } => {
-            upper_camel(name)
-        }
-        other => bail!("Haskell API type for {other:?} is not supported yet"),
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!(
+            "Map {} {}",
+            haskell_type_argument(key_type)?,
+            haskell_type_argument(value_type)?
+        ),
+        Type::Set { inner_type } => format!("Set {}", haskell_type_argument(inner_type)?),
+        Type::Timestamp => "Timestamp".to_string(),
+        Type::Duration => "Duration".to_string(),
+        Type::Box { inner_type } => haskell_api_type(inner_type)?,
+        Type::Interface { name, .. }
+        | Type::CallbackInterface { name, .. }
+        | Type::Record { name, .. }
+        | Type::Enum { name, .. }
+        | Type::Custom { name, .. } => upper_camel(name),
     })
+}
+
+fn haskell_type_argument(ty: &Type) -> Result<String> {
+    let rendered = haskell_api_type(ty)?;
+    if matches!(
+        ty,
+        Type::Optional { .. } | Type::Map { .. } | Type::Set { .. }
+    ) {
+        Ok(format!("({rendered})"))
+    } else {
+        Ok(rendered)
+    }
 }
 
 fn parenthesized_haskell_type(ty: &Type) -> Result<String> {
     let rendered = haskell_api_type(ty)?;
-    if matches!(ty, Type::Optional { .. }) {
+    if matches!(
+        ty,
+        Type::Optional { .. } | Type::Map { .. } | Type::Set { .. }
+    ) {
         Ok(format!("({rendered})"))
     } else {
         Ok(rendered)
@@ -1300,10 +2480,24 @@ fn parenthesized_haskell_type(ty: &Type) -> Result<String> {
 }
 
 fn haskell_ffi_argument_type(ty: &FfiType) -> Result<String> {
-    if is_by_value_struct(ty) {
-        Ok(format!("Ptr {}", haskell_ffi_struct_type(ty)?))
-    } else {
-        haskell_ffi_scalar_type(ty)
+    match ty {
+        FfiType::RustBuffer(_) | FfiType::ForeignBytes => {
+            Ok(format!("Ptr {}", haskell_ffi_struct_type(ty)?))
+        }
+        FfiType::Reference(inner) | FfiType::MutReference(inner) => {
+            Ok(format!("Ptr {}", haskell_ffi_pointee_type(inner)?))
+        }
+        FfiType::VoidPointer => Ok("Ptr ()".to_string()),
+        _ => haskell_ffi_scalar_type(ty),
+    }
+}
+
+fn haskell_ffi_pointee_type(ty: &FfiType) -> Result<String> {
+    match ty {
+        FfiType::RustBuffer(_) | FfiType::ForeignBytes => haskell_ffi_struct_type(ty),
+        FfiType::RustCallStatus => Ok("RustCallStatus".to_string()),
+        FfiType::VoidPointer => Ok("()".to_string()),
+        _ => haskell_ffi_scalar_type(ty),
     }
 }
 
@@ -1395,6 +2589,7 @@ fn is_haskell_keyword(value: &str) -> bool {
             | "infixr"
             | "instance"
             | "let"
+            | "map"
             | "module"
             | "negate"
             | "newtype"

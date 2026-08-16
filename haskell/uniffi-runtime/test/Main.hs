@@ -1,10 +1,14 @@
 module Main (main) where
 
-import Control.Exception (try)
+import Control.Exception (evaluate, try)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int8, Int16, Int32, Int64)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.Marshal.Alloc (allocaBytes)
@@ -25,6 +29,8 @@ main = do
   testTextCodec
   testBytesCodec
   testMaybeAndListCodecs
+  testMapAndSetCodecs
+  testTimeCodecs
   testDecoderFailures
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -44,6 +50,13 @@ assertDecoderFails label decoder input = do
   case result of
     Left _ -> pure ()
     Right () -> fail (label ++ ": decoder unexpectedly succeeded")
+
+assertEncoderFails :: String -> Encoder -> IO ()
+assertEncoderFails label encoder = do
+  result <- try (evaluate (ByteString.length (runEncoder encoder))) :: IO (Either UniFFIException Int)
+  case result of
+    Left _ -> pure ()
+    Right _ -> fail (label ++ ": encoder unexpectedly succeeded")
 
 alignUp :: Int -> Int -> Int
 alignUp offset boundary = ((offset + boundary - 1) `div` boundary) * boundary
@@ -228,6 +241,55 @@ testMaybeAndListCodecs = do
   assertCodec "Nothing" (ByteString.pack [0]) (writeMaybe writeWord8) (readMaybe readWord8) Nothing
   assertCodec "empty list" (ByteString.pack [0, 0, 0, 0]) (writeList writeWord8) (readList readWord8) []
 
+testMapAndSetCodecs :: IO ()
+testMapAndSetCodecs = do
+  let mapValue = Map.fromList [(-2, 0x0405), (1, 0x0203)] :: Map Int8 Word16
+      mapBytes = ByteString.pack [0, 0, 0, 2, 0xFE, 0x04, 0x05, 0x01, 0x02, 0x03]
+      emptyMap = Map.empty :: Map Int8 Word16
+      setValue = Set.fromList [0x1234, -2] :: Set Int16
+      setBytes = ByteString.pack [0, 0, 0, 2, 0xFF, 0xFE, 0x12, 0x34]
+      emptySet = Set.empty :: Set Int16
+  assertCodec "map" mapBytes (writeMap writeInt8 writeWord16) (readMap readInt8 readWord16) mapValue
+  assertCodec
+    "empty map"
+    (ByteString.pack [0, 0, 0, 0])
+    (writeMap writeInt8 writeWord16)
+    (readMap readInt8 readWord16)
+    emptyMap
+  assertCodec "set" setBytes (writeSet writeInt16) (readSet readInt16) setValue
+  assertCodec
+    "empty set"
+    (ByteString.pack [0, 0, 0, 0])
+    (writeSet writeInt16)
+    (readSet readInt16)
+    emptySet
+
+testTimeCodecs :: IO ()
+testTimeCodecs = do
+  let postEpoch = Timestamp 0x0123456789ABCDEF 999999999
+      postEpochBytes =
+        ByteString.pack
+          [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x3B, 0x9A, 0xC9, 0xFF]
+      preEpoch = Timestamp (-0x0123456789ABCDEF) 1
+      preEpochBytes =
+        ByteString.pack
+          [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x11, 0x00, 0x00, 0x00, 0x01]
+      duration = Duration 0xFEDCBA9876543210 500000000
+      durationBytes =
+        ByteString.pack
+          [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10, 0x1D, 0xCD, 0x65, 0x00]
+      malformedTimestamp = writeInt64 0 <> writeWord32 1000000000
+      malformedDuration = writeWord64 0 <> writeWord32 1000000000
+  assertCodec "post-epoch Timestamp" postEpochBytes writeTimestamp readTimestamp postEpoch
+  assertCodec "pre-epoch Timestamp" preEpochBytes writeTimestamp readTimestamp preEpoch
+  assertCodec "Duration" durationBytes writeDuration readDuration duration
+  assertEqual "Timestamp ordering" True (preEpoch < postEpoch)
+  assertEqual "Duration ordering" True (Duration 0 999999999 < Duration 1 0)
+  assertEncoderFails "Timestamp malformed nanoseconds" (writeTimestamp (Timestamp 0 1000000000))
+  assertEncoderFails "Duration malformed nanoseconds" (writeDuration (Duration 0 1000000000))
+  assertDecoderFails "Timestamp malformed nanoseconds" readTimestamp (runEncoder malformedTimestamp)
+  assertDecoderFails "Duration malformed nanoseconds" readDuration (runEncoder malformedDuration)
+
 testDecoderFailures :: IO ()
 testDecoderFailures = do
   assertDecoderFails
@@ -240,6 +302,8 @@ testDecoderFailures = do
     (ByteString.pack [0, 0, 0, 3, 0x01, 0x02])
   assertDecoderFails "invalid Bool tag" readBool (ByteString.pack [2])
   assertDecoderFails "invalid Maybe tag" (readMaybe readWord8) (ByteString.pack [2])
+  assertDecoderFails "negative map count" (readMap readWord8 readWord8) (ByteString.pack [0xFF, 0xFF, 0xFF, 0xFF])
+  assertDecoderFails "negative set count" (readSet readWord8) (ByteString.pack [0xFF, 0xFF, 0xFF, 0xFF])
   assertDecoderFails
     "invalid UTF-8"
     readText

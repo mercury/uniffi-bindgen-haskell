@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/uniffi-bindgen-haskell",
+  "tests/external-rust",
   "tests/fixture-rust",
 ]
 resolver = "2"

@@ -11,15 +11,18 @@ common test-settings
       test
       generated/haskell
   other-modules:
+      UniFFI.UniffiHaskellExternalFixture
       UniFFI.UniffiHaskellFixture
   build-depends:
       base >=4.15 && <5
     , bytestring >=0.10 && <0.13
+    , containers >=0.6 && <0.8
     , text >=1.2 && <2.2
     , uniffi-runtime
   include-dirs:
       generated/cbits
   c-sources:
+      generated/cbits/uniffi_uniffi_haskell_external_fixture_haskell.c
       generated/cbits/uniffi_uniffi_haskell_fixture_haskell.c
   cc-options: -std=c11
   extra-lib-dirs:
