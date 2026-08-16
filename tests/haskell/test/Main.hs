@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module Main (main) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
@@ -93,7 +95,19 @@ testCompoundTypes = do
           , scores = []
           , avatar = ByteString.empty
           }
+  assertEqual "named field name" (Text.pack "Ada Lovelace") person.name
+  assertEqual "named field age" (36 :: Word8) person.age
+  assertEqual
+    "named field nickname"
+    (Just (Text.pack "Enchantress of Numbers"))
+    person.nickname
+  assertEqual "named field scores" [minBound, -1, 0, 1, maxBound] person.scores
+  assertEqual "named field avatar" (ByteString.pack [0, 128, 255]) person.avatar
+  let updatedPerson = person {age = 37, nickname = Nothing}
+  assertEqual "named record update age" (37 :: Word8) updatedPerson.age
+  assertEqual "named record update nickname" Nothing updatedPerson.nickname
   roundtripPerson person >>= assertEqual "record" person
+  roundtripPerson updatedPerson >>= assertEqual "updated record" updatedPerson
   roundtripOptionalPerson (Just person) >>= assertEqual "optional record" (Just person)
   roundtripOptionalPerson Nothing >>= assertEqual "empty optional record" Nothing
   roundtripPeople [person, otherPerson] >>= assertEqual "record sequence" [person, otherPerson]
@@ -139,6 +153,8 @@ testRemainingValueTypes = do
   external <- External.makeExternalRecord (Text.pack "external") 42
   let expectedExternal = External.ExternalRecord (Text.pack "external") 42
   assertEqual "external namespace function" expectedExternal external
+  assertEqual "external record dot name" (Text.pack "external") external.name
+  assertEqual "external record dot value" 42 external.value
   roundtripExternalRecord external >>= assertEqual "external type roundtrip" expectedExternal
 
 testDefaultsAndRenames :: IO ()

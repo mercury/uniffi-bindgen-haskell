@@ -510,6 +510,7 @@ fn render_haskell(namespace: &Namespace, module_name: &str) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "{{-# LANGUAGE DuplicateRecordFields #-}}")?;
     writeln!(out, "{{-# LANGUAGE ForeignFunctionInterface #-}}")?;
+    writeln!(out, "{{-# LANGUAGE OverloadedRecordDot #-}}")?;
     writeln!(out, "{{-# LANGUAGE TypeApplications #-}}")?;
     writeln!(
         out,
@@ -852,9 +853,9 @@ fn render_haskell_callback_method(
     }
     let field_name = callback_field_name(type_name, &callable.name);
     let call = if lifted_names.is_empty() {
-        format!("{field_name} callback")
+        format!("callback.{field_name}")
     } else {
-        format!("{field_name} callback {}", lifted_names.join(" "))
+        format!("callback.{field_name} {}", lifted_names.join(" "))
     };
     writeln!(out, "    {call}")?;
     writeln!(out, "  case outcome of")?;
@@ -1449,22 +1450,19 @@ fn render_haskell_record(out: &mut String, record: &general::Record) -> Result<(
     if record.fields.is_empty() {
         writeln!(out, "encode{type_name} {type_name} = mempty")?;
     } else {
-        let variables: Vec<String> = (0..record.fields.len())
-            .map(|index| format!("field{index}"))
-            .collect();
-        writeln!(
-            out,
-            "encode{type_name} ({type_name} {}) =",
-            variables.join(" ")
-        )?;
+        writeln!(out, "encode{type_name} value =")?;
         render_encoder_chain(
             out,
             "  ",
             record
                 .fields
                 .iter()
-                .zip(&variables)
-                .map(|(field, variable)| encoder_expression(&field.ty.ty, variable))
+                .map(|field| {
+                    encoder_expression(
+                        &field.ty.ty,
+                        &format!("value.{}", haskell_value_name(&field.name)),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
         )?;
     }
