@@ -27,11 +27,12 @@ case "$(uname -s)" in
 esac
 
 generated_dir="$project_root/tests/haskell/generated"
+rm -rf "$generated_dir"
 cargo run -p uniffi-bindgen-haskell --bin uniffi-bindgen-haskell -- \
   --library "$fixture_library" \
   --out-dir "$generated_dir" \
-  --cabal-file uniffi-haskell-fixture-bindings.cabal \
-  --cabal-package-name uniffi-haskell-fixture-bindings \
+  --cabal-file uniffi-haskell-tests.cabal \
+  --cabal-header "$project_root/tests/haskell/cabal-header.txt" \
   --cabal-extra-lib-dir "$generated_dir/native-static"
 
 mkdir -p "$generated_dir/native-static"

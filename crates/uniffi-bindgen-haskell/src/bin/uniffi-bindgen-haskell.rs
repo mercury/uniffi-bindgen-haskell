@@ -1,3 +1,5 @@
+use std::fs;
+
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::Parser;
@@ -19,17 +21,18 @@ struct Arguments {
     #[arg(
         long,
         value_name = "FILE",
+        requires = "cabal_header",
         help = "Emit a Cabal package file relative to --out-dir"
     )]
     cabal_file: Option<Utf8PathBuf>,
 
     #[arg(
         long,
-        default_value = "uniffi-generated-bindings",
-        value_name = "NAME",
-        help = "Package name used by --cabal-file"
+        value_name = "PATH",
+        requires = "cabal_file",
+        help = "File whose contents are copied verbatim before the generated library stanza"
     )]
-    cabal_package_name: String,
+    cabal_header: Option<Utf8PathBuf>,
 
     #[arg(
         long,
@@ -51,6 +54,12 @@ fn main() -> Result<()> {
     let cabal = arguments
         .cabal_file
         .map(|file_name| -> Result<CabalOptions> {
+            let header_path = arguments
+                .cabal_header
+                .as_ref()
+                .context("--cabal-file requires --cabal-header")?;
+            let header = fs::read_to_string(header_path)
+                .with_context(|| format!("failed to read Cabal header {header_path}"))?;
             let native_library = arguments
                 .cabal_native_library
                 .clone()
@@ -58,7 +67,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| infer_native_library(&arguments.library))?;
             Ok(CabalOptions {
                 file_name,
-                package_name: arguments.cabal_package_name.clone(),
+                header,
                 native_library,
                 extra_lib_dir: arguments.cabal_extra_lib_dir.clone(),
             })

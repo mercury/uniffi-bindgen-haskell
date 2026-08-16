@@ -7,7 +7,7 @@ mod uniffi_adapter;
 
 pub struct CabalOptions {
     pub file_name: Utf8PathBuf,
-    pub package_name: String,
+    pub header: String,
     pub native_library: String,
     pub extra_lib_dir: Option<Utf8PathBuf>,
 }

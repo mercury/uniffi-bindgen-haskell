@@ -68,22 +68,17 @@ fn write_cabal_file(out_dir: &Utf8Path, manifest: &Manifest, options: &CabalOpti
     if options.file_name.is_absolute() || file_name.contains('/') || file_name.contains('\\') {
         bail!("--cabal-file must be a file name relative to --out-dir");
     }
-    if options.package_name.is_empty()
-        || !options
-            .package_name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-    {
-        bail!("--cabal-package-name must contain only ASCII letters, digits, and hyphens");
+    if options.header.trim().is_empty() {
+        bail!("--cabal-header must not be empty");
     }
 
-    let mut output = String::new();
-    writeln!(output, "cabal-version: 3.0")?;
-    writeln!(output, "name: {}", options.package_name)?;
-    writeln!(output, "version: 0.1.0.0")?;
-    writeln!(output, "license: MPL-2.0")?;
-    writeln!(output, "build-type: Simple")?;
-    writeln!(output)?;
+    let mut output = options.header.clone();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
     writeln!(output, "library")?;
     writeln!(output, "  exposed-modules:")?;
     for module in &manifest.public_haskell_modules {
