@@ -12,6 +12,8 @@ crate-type = ["cdylib", "staticlib"]
 uniffi = "=0.32.0"
 ```
 
+This library is largely "vibecoded" under careful human review.
+
 ## Raw Haskell files
 
 Build the Rust crate, then run:
