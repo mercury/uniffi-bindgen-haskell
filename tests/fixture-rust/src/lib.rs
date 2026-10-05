@@ -182,6 +182,69 @@ pub fn roundtrip_counter(value: Arc<Counter>) -> Arc<Counter> {
     value
 }
 
+/// An object whose constructor takes *buffer-typed* arguments (a `String` and a
+/// record). Constructors with only scalar arguments (`Counter::new`) don't
+/// exercise argument lowering; these do.
+#[derive(uniffi::Object)]
+pub struct Labeled {
+    label: String,
+    owner: Person,
+}
+
+#[uniffi::export]
+impl Labeled {
+    #[uniffi::constructor]
+    pub fn new(label: String, owner: Person) -> Self {
+        Self { label, owner }
+    }
+
+    pub fn describe(&self) -> String {
+        format!("{} owned by {}", self.label, self.owner.name)
+    }
+}
+
+/// A *flat* error: its variants declare no fields, but the Display message
+/// crosses the FFI after the variant index.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum FlatError {
+    #[error("flat failure: {0}")]
+    Failure(String),
+    #[error("flat other")]
+    Other,
+}
+
+#[uniffi::export]
+pub fn flat_fail(message: String, other: bool) -> Result<(), FlatError> {
+    if other {
+        Err(FlatError::Other)
+    } else {
+        Err(FlatError::Failure(message))
+    }
+}
+
+/// Two records that share a field name (`id`): the public module re-exports
+/// both, which GHC only accepts with `DuplicateRecordFields`.
+#[derive(uniffi::Record)]
+pub struct Alpha {
+    pub id: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct Beta {
+    pub id: u32,
+}
+
+#[uniffi::export]
+pub fn make_alpha(id: u32) -> Alpha {
+    Alpha { id }
+}
+
+#[uniffi::export]
+pub fn make_beta(id: u32) -> Beta {
+    Beta { id }
+}
+
 #[uniffi::export]
 pub fn roundtrip_person(value: Person) -> Person {
     value
