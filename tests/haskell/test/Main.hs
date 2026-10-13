@@ -30,6 +30,9 @@ main = do
   runGroup "remaining value types" testRemainingValueTypes
   runGroup "defaults and renames" testDefaultsAndRenames
   runGroup "errors" testErrors
+  runGroup "buffer-typed constructor arguments" testBufferConstructors
+  runGroup "flat errors" testFlatErrors
+  runGroup "duplicate record fields" testDuplicateFields
   runGroup "async" testAsync
   runGroup "callbacks" testCallbacks
   runGroup "objects" testObjects
@@ -188,6 +191,33 @@ testErrors = do
       (Left (TestErrorInvalidDivision (Text.pack "integer overflow")))
   divide 9 (-3)
     >>= assertEqual "unnamed error payload" (Left (TestErrorNegativeDivisor 3))
+
+testBufferConstructors :: IO ()
+testBufferConstructors = do
+  let owner =
+        Person
+          { name = Text.pack "Ada"
+          , age = 36
+          , nickname = Nothing
+          , scores = []
+          , avatar = ByteString.empty
+          }
+  labeled <- newLabeled (Text.pack "engine") owner
+  labeledDescribe labeled >>= assertEqual "constructor lowered String + record" (Text.pack "engine owned by Ada")
+
+testFlatErrors :: IO ()
+testFlatErrors = do
+  flatFail (Text.pack "nope") False
+    >>= assertEqual "flat error keeps its message" (Left (FlatErrorFailure (Text.pack "flat failure: nope")))
+  flatFail Text.empty True
+    >>= assertEqual "flat unit variant keeps its message" (Left (FlatErrorOther (Text.pack "flat other")))
+
+testDuplicateFields :: IO ()
+testDuplicateFields = do
+  Alpha a <- makeAlpha 3
+  Beta b <- makeBeta 4
+  assertEqual "alpha id" 3 a
+  assertEqual "beta id" 4 b
 
 testAsync :: IO ()
 testAsync = do

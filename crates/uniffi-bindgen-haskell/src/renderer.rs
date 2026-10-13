@@ -545,6 +545,9 @@ fn is_by_value_struct(ty: &FfiType) -> bool {
 
 fn render_haskell_public(namespace: &Namespace, module_name: &str) -> Result<String> {
     let mut out = String::new();
+    // Records in one component can share field names (e.g. `port`); the facade
+    // re-exports them all, which GHC only allows with this extension.
+    writeln!(out, "{{-# LANGUAGE DuplicateRecordFields #-}}")?;
     writeln!(out, "module {module_name}")?;
     writeln!(out, "  ( initialize")?;
     for definition in &namespace.type_definitions {
@@ -1217,6 +1220,8 @@ fn render_haskell_constructor(
         writeln!(out, "{function_name} {} = do", argument_names.join(" "))?;
     }
     writeln!(out, "  initialize")?;
+    render_argument_prelude(out, callable, &argument_names)?;
+    let indent = render_argument_scopes(out, callable, &argument_names)?;
     let lowered = callable
         .arguments
         .iter()
@@ -1226,15 +1231,95 @@ fn render_haskell_constructor(
         })
         .collect::<Result<Vec<_>>>()?;
     let args = append_call_arguments(&lowered, &["statusPtr"]);
-    writeln!(out, "  (handle, status) <-")?;
-    writeln!(out, "    withRustCallStatus $ \\statusPtr ->")?;
-    writeln!(out, "      c_{function_name} {args}")?;
-    writeln!(out, "  checkRustCallStatus c_rustBufferFree status")?;
+    writeln!(out, "{indent}(handle, status) <-")?;
+    writeln!(out, "{indent}  withRustCallStatus $ \\statusPtr ->")?;
+    writeln!(out, "{indent}    c_{function_name} {args}")?;
+    writeln!(out, "{indent}checkRustCallStatus c_rustBufferFree status")?;
     writeln!(
         out,
-        "  {type_name} <$> newRustObject handle release{type_name}"
+        "{indent}{type_name} <$> newRustObject handle release{type_name}"
     )?;
     Ok(())
+}
+
+/// Bind every argument that needs a pre-call conversion (callback handles,
+/// cloned object handles, serialized RustBuffers). Constructors need exactly
+/// the same lowering as methods; without it the generated code referenced
+/// `lowered_<arg>_ptr` variables that were never defined.
+fn render_argument_prelude(
+    out: &mut String,
+    callable: &general::Callable,
+    argument_names: &[String],
+) -> Result<()> {
+    for (argument, name) in callable.arguments.iter().zip(argument_names) {
+        if matches!(argument.ty.ty, Type::CallbackInterface { .. }) {
+            writeln!(out, "  callback_{name}_handle <- newCallbackHandle {name}")?;
+        }
+        if let Type::Interface {
+            name: interface_name,
+            ..
+        } = &argument.ty.ty
+        {
+            writeln!(
+                out,
+                "  object_{name}_handle <- clone{}Handle {name}",
+                upper_camel(interface_name)
+            )?;
+        }
+        if matches!(argument.ty.ffi_type, FfiType::RustBuffer(_)) {
+            let encoded = match &argument.ty.ty {
+                Type::String => format!("encodeUtf8 {name}"),
+                other => {
+                    writeln!(
+                        out,
+                        "  let serialized_{name} = runEncoder ({})",
+                        encoder_expression(other, name)?
+                    )?;
+                    format!("serialized_{name}")
+                }
+            };
+            writeln!(
+                out,
+                "  lowered_{name} <- lowerRustBuffer c_rustBufferFromBytes c_rustBufferFree ({encoded})"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Open the `with…` scopes that keep lowered buffers alive across the call;
+/// returns the indentation the call itself must use.
+fn render_argument_scopes(
+    out: &mut String,
+    callable: &general::Callable,
+    argument_names: &[String],
+) -> Result<String> {
+    let mut indent = "  ".to_string();
+    for (argument, name) in callable.arguments.iter().zip(argument_names) {
+        match &argument.ty.ffi_type {
+            FfiType::RustBuffer(_) => {
+                writeln!(
+                    out,
+                    "{indent}with lowered_{name} $ \\lowered_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            FfiType::ForeignBytes => {
+                let with_function = if is_mutable_borrowed_bytes(argument) {
+                    "withMutableForeignBytes"
+                } else {
+                    "withForeignBytes"
+                };
+                writeln!(
+                    out,
+                    "{indent}{with_function} {name} $ \\borrowed_{name}_ptr -> do"
+                )?;
+                indent.push_str("  ");
+            }
+            _ => {}
+        }
+    }
+    Ok(indent)
 }
 
 fn render_haskell_method(
@@ -1525,6 +1610,14 @@ fn render_haskell_record(out: &mut String, record: &general::Record) -> Result<(
 
 fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
     let type_name = upper_camel(&enum_.name);
+    // `#[uniffi(flat_error)]` enums cross the FFI as `variant index + message
+    // string` (the same layout the Kotlin/Python bindings read), even though
+    // the variants declare no fields. Treating them as plain enums leaves the
+    // message unread and the decoder fails with "left N trailing bytes".
+    let flat_error = {
+        let shape = format!("{:?}", enum_.shape);
+        shape.contains("Error") && shape.contains("flat: true")
+    };
     for (index, variant) in enum_.variants.iter().enumerate() {
         let prefix = if index == 0 {
             format!("data {type_name} =")
@@ -1532,11 +1625,15 @@ fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
             "  |".to_string()
         };
         let constructor = format!("{}{}", type_name, upper_camel(&variant.name));
-        let field_types = variant
-            .fields
-            .iter()
-            .map(|field| haskell_api_type(&field.ty.ty))
-            .collect::<Result<Vec<_>>>()?;
+        let field_types = if flat_error {
+            vec!["Text".to_string()]
+        } else {
+            variant
+                .fields
+                .iter()
+                .map(|field| haskell_api_type(&field.ty.ty))
+                .collect::<Result<Vec<_>>>()?
+        };
         if field_types.is_empty() {
             writeln!(out, "{prefix} {constructor}")?;
         } else {
@@ -1553,7 +1650,8 @@ fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
     writeln!(out, "  case value of")?;
     for (index, variant) in enum_.variants.iter().enumerate() {
         let constructor = format!("{}{}", type_name, upper_camel(&variant.name));
-        let variables: Vec<String> = (0..variant.fields.len())
+        let field_count = if flat_error { 1 } else { variant.fields.len() };
+        let variables: Vec<String> = (0..field_count)
             .map(|field_index| format!("field{field_index}"))
             .collect();
         let pattern = if variables.is_empty() {
@@ -1562,14 +1660,18 @@ fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
             format!("{constructor} {}", variables.join(" "))
         };
         let mut encoders = vec![format!("writeInt32 {}", index + 1)];
-        encoders.extend(
-            variant
-                .fields
-                .iter()
-                .zip(&variables)
-                .map(|(field, variable)| encoder_expression(&field.ty.ty, variable))
-                .collect::<Result<Vec<_>>>()?,
-        );
+        if flat_error {
+            encoders.push(format!("writeText {}", variables[0]));
+        } else {
+            encoders.extend(
+                variant
+                    .fields
+                    .iter()
+                    .zip(&variables)
+                    .map(|(field, variable)| encoder_expression(&field.ty.ty, variable))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
         write!(out, "    {pattern} -> ")?;
         writeln!(out, "{}", encoders.join(" <> "))?;
     }
@@ -1580,11 +1682,15 @@ fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
     writeln!(out, "  case tag of")?;
     for (index, variant) in enum_.variants.iter().enumerate() {
         let constructor = format!("{}{}", type_name, upper_camel(&variant.name));
-        let decoders = variant
-            .fields
-            .iter()
-            .map(|field| decoder_expression(&field.ty.ty))
-            .collect::<Result<Vec<_>>>()?;
+        let decoders = if flat_error {
+            vec!["readText".to_string()]
+        } else {
+            variant
+                .fields
+                .iter()
+                .map(|field| decoder_expression(&field.ty.ty))
+                .collect::<Result<Vec<_>>>()?
+        };
         if decoders.is_empty() {
             writeln!(out, "    {} -> pure {constructor}", index + 1)?;
         } else {
