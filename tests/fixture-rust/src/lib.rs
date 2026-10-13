@@ -223,6 +223,23 @@ pub fn flat_fail(message: String, other: bool) -> Result<(), FlatError> {
     }
 }
 
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error, with_try_read)]
+pub enum FlatInputError {
+    #[error("first flat input")]
+    First,
+    #[error("second flat input")]
+    Second,
+}
+
+#[uniffi::export]
+pub fn flat_input_code(value: FlatInputError) -> u8 {
+    match value {
+        FlatInputError::First => 1,
+        FlatInputError::Second => 2,
+    }
+}
+
 /// Two records that share a field name (`id`): the public module re-exports
 /// both, which GHC only accepts with `DuplicateRecordFields`.
 #[derive(uniffi::Record)]
