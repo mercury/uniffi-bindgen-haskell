@@ -1610,14 +1610,7 @@ fn render_haskell_record(out: &mut String, record: &general::Record) -> Result<(
 
 fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
     let type_name = upper_camel(&enum_.name);
-    // `#[uniffi(flat_error)]` enums cross the FFI as `variant index + message
-    // string` (the same layout the Kotlin/Python bindings read), even though
-    // the variants declare no fields. Treating them as plain enums leaves the
-    // message unread and the decoder fails with "left N trailing bytes".
-    let flat_error = {
-        let shape = format!("{:?}", enum_.shape);
-        shape.contains("Error") && shape.contains("flat: true")
-    };
+    let flat_error = matches!(enum_.shape, general::EnumShape::Error { flat: true });
     for (index, variant) in enum_.variants.iter().enumerate() {
         let prefix = if index == 0 {
             format!("data {type_name} =")
@@ -1650,19 +1643,20 @@ fn render_haskell_enum(out: &mut String, enum_: &general::Enum) -> Result<()> {
     writeln!(out, "  case value of")?;
     for (index, variant) in enum_.variants.iter().enumerate() {
         let constructor = format!("{}{}", type_name, upper_camel(&variant.name));
-        let field_count = if flat_error { 1 } else { variant.fields.len() };
-        let variables: Vec<String> = (0..field_count)
-            .map(|field_index| format!("field{field_index}"))
-            .collect();
+        let variables: Vec<String> = if flat_error {
+            vec!["_".to_string()]
+        } else {
+            (0..variant.fields.len())
+                .map(|field_index| format!("field{field_index}"))
+                .collect()
+        };
         let pattern = if variables.is_empty() {
             constructor
         } else {
             format!("{constructor} {}", variables.join(" "))
         };
         let mut encoders = vec![format!("writeInt32 {}", index + 1)];
-        if flat_error {
-            encoders.push(format!("writeText {}", variables[0]));
-        } else {
+        if !flat_error {
             encoders.extend(
                 variant
                     .fields
