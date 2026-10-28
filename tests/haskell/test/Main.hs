@@ -211,6 +211,8 @@ testFlatErrors = do
     >>= assertEqual "flat error keeps its message" (Left (FlatErrorFailure (Text.pack "flat failure: nope")))
   flatFail Text.empty True
     >>= assertEqual "flat unit variant keeps its message" (Left (FlatErrorOther (Text.pack "flat other")))
+  flatInputCode (FlatInputErrorFirst (Text.pack "ignored message"))
+    >>= assertEqual "flat error input" 1
 
 testDuplicateFields :: IO ()
 testDuplicateFields = do
